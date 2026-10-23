@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "case_id": "representative_order_service",
+  "expected": [
+    {
+      "id": "sql_injection",
+      "category": "security.sql_injection",
+      "file_path": "examples/review_target.py",
+      "line_start": 33,
+      "line_end": 34
+    },
+    {
+      "id": "owner_authorization",
+      "category": "security.authorization",
+      "file_path": "examples/review_target.py",
+      "line_start": 44,
+      "line_end": 46
+    },
+    {
+      "id": "empty_average",
+      "category": "correctness.empty_input",
+      "file_path": "examples/review_target.py",
+      "line_start": 12,
+      "line_end": 13
+    },
+    {
+      "id": "one_based_pagination",
+      "category": "correctness.pagination",
+      "file_path": "examples/review_target.py",
+      "line_start": 23,
+      "line_end": 24
+    },
+    {
+      "id": "shared_default_store",
+      "category": "correctness.shared_state",
+      "file_path": "examples/review_target.py",
+      "line_start": 51,
+      "line_end": 51
+    }
+  ],
+  "source_hashes": {
+    "examples/review_target.py": "cc3ccd919e88d85333953f8a778745bb0a151c2479f6363796453990d291b22b"
+  }
+}

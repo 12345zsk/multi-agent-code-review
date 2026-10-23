@@ -4,8 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "multi-agent-code-review"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.0.0,<2",
+    "langgraph-checkpoint-sqlite>=3.1,<4",
+    "langchain-core>=1.0.0,<2",
+    "langchain-deepseek>=1.0.0,<2",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0,<3",
+]
 
 [project.scripts]
 code-review = "src.cli:main"
@@ -13,3 +21,6 @@ code-review = "src.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*", "evals*", "examples*", "code_review*"]
+
+[tool.setuptools.package-data]
+evals = ["labels/*.json"]

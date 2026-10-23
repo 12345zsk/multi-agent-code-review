@@ -1,8 +1,13 @@
 # Environment
 .env
+.env.*
+!.env.example
 
 # Logs
 logs/
+
+# Generated review reports and candidate patches
+/output/
 
 # Python
 __pycache__/
