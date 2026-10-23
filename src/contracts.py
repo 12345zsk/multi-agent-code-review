@@ -84,12 +84,19 @@ class WorkflowState(TypedDict, total=False):
     model_name: str
     react: bool
     write_root: str | None
+    auto_write_root: str | None
     write_result: dict
     diagnostics: list[dict]
     trace_events: list[dict]
     code_diff: str
     file_paths: list[str]
     mode: Literal["review", "fix"]
+    review_scope: Literal["diff", "file"]
+    target_file: str | None
+    resolve_target: bool
+    source_root: str
+    run_history_root: str | None
+    target_reference: str
     user_task: str
     requested_mode: Literal["review", "fix"] | None
     requested_agents: list[str] | None

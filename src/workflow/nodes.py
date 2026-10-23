@@ -35,8 +35,8 @@ def reporter_node(state: WorkflowState) -> dict:
         if intent.get("unsupported_requests"):
             lines.extend(["", "不支持的要求：", *["- " + item for item in intent["unsupported_requests"]]])
         lines.extend(["", "本次未执行代码审查、修正或文件写入。",
-                      "当前支持：对提供的 diff 进行审查、修正确认的缺陷、生成候选回归测试及静态/模型验证。",
-                      "显式授权后可写回通过校验的候选；不支持运行目标测试、联网、部署或新功能开发。"])
+                      "当前支持：审查提供的 diff 或显式指定的源码文件、修正确认的缺陷、生成候选回归测试及静态/模型验证。",
+                      "自然语言明确要求修正本地文件时，可校验、备份后写回；不支持运行目标测试、联网、部署或新功能开发。"])
         return {"status": intent["status"], "final_review": redact("\n".join(lines))}
 
     reports = state.get("reports", {})
@@ -75,12 +75,14 @@ def reporter_node(state: WorkflowState) -> dict:
         verdict = "APPROVE"
     lines = [
         "# Code Review", f"Mode: {state['mode']} | Status: {status}",
-        f"Verdict on input diff: {verdict}",
+        f"Verdict on input {'source file' if state.get('review_scope') == 'file' else 'diff'}: {verdict}",
         f"Run ID: {state.get('run_id', 'untracked')} | Model: {state.get('model_name', 'unknown')}",
         "", "## Review coverage",
     ]
     if state.get("react"):
         lines.insert(4, "Review strategy: ReAct | Tool: read_source (input snapshot only)")
+    if state.get("review_scope") == "file":
+        lines.insert(4, "Review scope: full source file | Target: " + ", ".join(state["file_paths"]))
     if intent.get("status") == "accepted":
         lines.extend(["## Task guidance", intent["guidance"], ""])
     elif state.get("user_task") and state.get("errors"):
@@ -138,7 +140,9 @@ def reporter_node(state: WorkflowState) -> dict:
         for item in result.get("files", []):
             lines.append(f"- {item['file_path']}: {item['status']} | backup: {item.get('backup') or 'new file; no previous content'}")
         lines.append("Backups and per-file write receipts: " + state.get("run_dir", "") + "/writes/")
-        if result.get("status") != "written":
+        if status == "completed" and not actionable and not failed:
+            lines.append("No confirmed fixable findings; local files were not changed.")
+        elif result.get("status") != "written":
             lines.append("Interrupted writes may be partial; inspect per-file receipts before editing or resuming.")
     if pending:
         lines.extend(["", "Pending implementations: " + ", ".join(pending)])

@@ -27,15 +27,22 @@ def run_workflow(
     model=None, file_contents: Mapping[str, str] | None = None, scaffold: bool = False,
     run_root: str | Path | None = None,
     write_root: str | Path | None = None,
+    auto_write_root: str | Path | None = None,
     task: str | None = None,
+    review_scope: Literal["diff", "file"] = "diff",
+    target_file: str | None = None,
 ) -> WorkflowState:
-    """Review with ReAct; optional task is admitted first, write_root explicitly authorizes writes."""
+    """Review with ReAct; task admission may enable guarded writes within auto_write_root."""
     if not isinstance(code_diff, str) or not code_diff.strip():
         raise ValueError("code_diff must not be empty")
     if len(code_diff) > MAX_DIFF_CHARS:
         raise ValueError("Diff exceeds MAX_DIFF_CHARS; split it into smaller reviews")
     if mode not in (None, "review", "fix"):
         raise ValueError("mode must be review or fix")
+    if review_scope not in ("diff", "file"):
+        raise ValueError("review_scope must be diff or file")
+    if target_file is not None and (review_scope != "file" or not isinstance(target_file, str) or not Path(target_file).is_absolute()):
+        raise ValueError("target_file requires an absolute path in file scope")
     if task is not None:
         from src.task_intent import MAX_TASK_CHARS
         if not isinstance(task, str) or not task.strip() or len(task) > MAX_TASK_CHARS:
@@ -50,6 +57,14 @@ def run_workflow(
         write_root = Path(write_root).resolve(strict=True)
         if not write_root.is_dir():
             raise ValueError("write_root must be a directory")
+    if auto_write_root is not None:
+        if task is None or scaffold:
+            raise ValueError("auto_write_root requires a natural-language task and no scaffold")
+        auto_write_root = Path(auto_write_root).resolve(strict=True)
+        if not auto_write_root.is_dir():
+            raise ValueError("auto_write_root must be a directory")
+        if write_root is not None and auto_write_root != write_root:
+            raise ValueError("Automatic and explicit write boundaries must match")
     selected = list(dict.fromkeys(AGENT_IDS if active_agents is None else active_agents))
     if set(selected) - set(AGENT_IDS):
         raise ValueError("active_agents contains unknown specialist IDs")
@@ -62,14 +77,79 @@ def run_workflow(
     if sum(len(content) for content in sources.values()) > MAX_DIFF_CHARS*3:
         raise ValueError("Source context exceeds the input budget")
     validate_source_context(sources, changes)
+    _validate_file_scope(sanitized_diff, paths, sources, review_scope)
     build_workflow_graph(handlers, model=model, scaffold=scaffold)
     inputs = {"code_diff": sanitized_diff, "file_paths": paths, "file_contents": sources,
               "mode": mode or "review", "active_agents": selected, "max_fix_attempts": max_fix_attempts, "scaffold": scaffold, "react": not scaffold,
               "user_task": redact(task) if task is not None else "", "requested_mode": mode,
               "requested_agents": selected if active_agents is not None else None,
-              "write_root": str(write_root) if write_root is not None else None}
+              "review_scope": review_scope, "target_file": target_file,
+              "write_root": str(write_root) if write_root is not None else None,
+              "auto_write_root": str(auto_write_root) if auto_write_root is not None else None}
     store = RunStore.create(run_root, inputs) if run_root is not None else None
     return _execute(inputs, store, model=model, handlers=handlers)
+
+
+def _validate_file_scope(code_diff, paths, sources, review_scope):
+    if review_scope == "file":
+        from src.source_input import source_snapshot
+        if len(paths) != 1 or set(sources) != set(paths) or code_diff != source_snapshot(paths[0], sources[paths[0]]):
+            raise ValueError("File scope requires one complete, matching source snapshot")
+
+
+def run_file_workflow(
+    file_path: str | Path, *, source_root: str | Path = ".", write_files: bool | None = None,
+    run_root: str | Path | None = None, mode: Literal["review", "fix"] | None = None,
+    task: str | None = None, active_agents: Sequence[str] | None = None,
+    max_fix_attempts: int = 2, model=None, scaffold: bool = False,
+    handlers: Mapping[str, NodeHandler] | None = None,
+) -> WorkflowState:
+    """Review a file; natural-language goals decide writes unless write_files overrides them."""
+    from src.source_input import read_target, source_snapshot
+    if write_files is not None and type(write_files) is not bool:
+        raise ValueError("write_files must be a boolean or None")
+    root, relative, source = read_target(file_path, source_root, run_root=run_root)
+    absolute_target = str(file_path) if Path(file_path).is_absolute() else str(root/relative)
+    return run_workflow(
+        source_snapshot(relative, source), [relative], review_scope="file", target_file=absolute_target,
+        file_contents={relative: source}, write_root=root if write_files else None,
+        auto_write_root=root if task is not None and write_files is None else None,
+        run_root=run_root, mode=mode, task=task, active_agents=active_agents,
+        max_fix_attempts=max_fix_attempts, model=model, scaffold=scaffold, handlers=handlers,
+    )
+
+
+def run_task_workflow(
+    task: str, *, source_root: str | Path = ".", run_root: str | Path | None = None,
+    mode: Literal["review", "fix"] | None = None, active_agents: Sequence[str] | None = None,
+    max_fix_attempts: int = 2, model=None, write_files: bool | None = None,
+) -> WorkflowState:
+    """Resolve a file from natural language, then review and optionally repair it in place."""
+    from src.task_intent import MAX_TASK_CHARS
+    if not isinstance(task, str) or not task.strip() or len(task) > MAX_TASK_CHARS:
+        raise ValueError("task must contain 1 to 4000 characters")
+    if mode not in (None, "review", "fix"):
+        raise ValueError("mode must be review or fix")
+    if type(max_fix_attempts) is not int or max_fix_attempts < 1:
+        raise ValueError("max_fix_attempts must be a positive integer")
+    if write_files is not None and type(write_files) is not bool:
+        raise ValueError("write_files must be a boolean or None")
+    selected = list(dict.fromkeys(AGENT_IDS if active_agents is None else active_agents))
+    if set(selected) - set(AGENT_IDS):
+        raise ValueError("active_agents contains unknown specialist IDs")
+    root = Path(source_root).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("source_root must be a directory")
+    inputs = {"code_diff": "", "file_paths": [], "file_contents": {}, "mode": mode or "review",
+              "active_agents": selected, "max_fix_attempts": max_fix_attempts, "scaffold": False, "react": True,
+              "user_task": redact(task), "requested_mode": mode,
+              "requested_agents": selected if active_agents is not None else None,
+              "review_scope": "file", "target_file": None, "resolve_target": True,
+              "source_root": str(root), "run_history_root": str(Path(run_root).resolve()) if run_root is not None else None,
+              "write_root": str(root) if write_files else None,
+              "auto_write_root": str(root) if write_files is None else None}
+    store = RunStore.create(run_root, inputs) if run_root is not None else None
+    return _execute(inputs, store, model=model)
 
 
 def resume_workflow(run_id: str, *, run_root="output/runs", model=None, handlers=None,
@@ -79,7 +159,13 @@ def resume_workflow(run_id: str, *, run_root="output/runs", model=None, handlers
         raise ValueError("additional_fix_attempts must be a positive integer")
     store = RunStore.open(run_root, run_id)
     inputs = store.read_inputs()
-    validate_source_context(inputs["file_contents"], parse_diff(inputs["code_diff"]))
+    if inputs.get("resolve_target") and not (store.path/"checkpoint.sqlite").is_file() and any(
+        event["node"] == "task_interpreter" and event["event"] == "node_completed" for event in store.read_events()
+    ):
+        raise ValueError("Saved target checkpoint is missing; start a new run instead of resolving another target")
+    if not inputs.get("resolve_target"):
+        validate_source_context(inputs["file_contents"], parse_diff(inputs["code_diff"]))
+        _validate_file_scope(inputs["code_diff"], inputs["file_paths"], inputs["file_contents"], inputs.get("review_scope", "diff"))
     return _execute(inputs, store, model=model, handlers=handlers, resume=True,
                     allow_code_change=allow_code_change, additional_fix_attempts=additional_fix_attempts)
 
@@ -176,8 +262,17 @@ def _execute(inputs, store, *, model=None, handlers=None, resume=False, allow_co
             finished_snapshot = False
             if resume:
                 snapshot = graph.get_state(config)
+                if inputs.get("resolve_target") and not snapshot.values and any(
+                    event["node"] == "task_interpreter" and event["event"] == "node_completed" for event in tracer.events
+                ):
+                    from src.model_agent import ModelOutputError
+                    raise ModelOutputError("Saved target snapshot is missing; start a new run",
+                                           code="REQUEST_SNAPSHOT_MISSING", stage="checkpoint_validation")
                 if snapshot.values:
                     state = dict(snapshot.values)
+                    if inputs.get("resolve_target") and state.get("file_paths"):
+                        validate_source_context(state["file_contents"], parse_diff(state["code_diff"]))
+                        _validate_file_scope(state["code_diff"], state["file_paths"], state["file_contents"], "file")
                     state["model_name"] = _model_name(model, inputs["scaffold"])
                     if snapshot.next:
                         invoke_input = None

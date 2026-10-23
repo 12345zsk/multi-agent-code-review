@@ -48,6 +48,44 @@ class ModelPatchTests(unittest.TestCase):
         canonical = canonicalize_patch(patch, {"example.py": "old"})
         self.assertEqual(apply_patch({"example.py": "old"}, parse_diff(canonical))["example.py"], "new")
 
+    def test_missing_old_eof_marker_is_recovered_from_exact_source(self):
+        source = "import\n\ndef main():\n    return 1/0"
+        patch = "--- a/example.py\n+++ b/example.py\n@@ -1,4 +1,3 @@\n-import\n \n def main():\n-    return 1/0\n+    return 1\n"
+        with self.assertRaises(DiffError):
+            apply_patch({"example.py": source}, parse_diff(patch))
+        canonical = canonicalize_patch(patch, {"example.py": source})
+        self.assertIn("-    return 1/0\n\\ No newline at end of file\n", canonical)
+        self.assertEqual(apply_patch({"example.py": source}, parse_diff(canonical))["example.py"],
+                         "\ndef main():\n    return 1\n")
+        self.assertEqual(canonicalize_patch(canonical, {"example.py": source}), canonical)
+
+    def test_missing_marker_on_unchanged_eof_context_preserves_source_newline(self):
+        source = "value = 1\ntail"
+        patch = "--- a/example.py\n+++ b/example.py\n@@ -1,2 +1,2 @@\n-value = 1\n+value = 2\n tail\n"
+        canonical = canonicalize_patch(patch, {"example.py": source})
+        self.assertEqual(apply_patch({"example.py": source}, parse_diff(canonical))["example.py"], "value = 2\ntail")
+
+    def test_eof_repair_does_not_hide_ambiguous_reanchoring(self):
+        source = "repeat()\nseparator\nrepeat()"
+        patch = "--- a/example.py\n+++ b/example.py\n@@ -20,1 +20,1 @@\n-repeat()\n+fixed()\n"
+        with self.assertRaisesRegex(DiffError, "ambiguous"):
+            canonicalize_patch(patch, {"example.py": source})
+        canonical = canonicalize_patch(patch.replace("-20,1 +20,1", "-3,1 +3,1"), {"example.py": source})
+        self.assertEqual(apply_patch({"example.py": source}, parse_diff(canonical))["example.py"],
+                         "repeat()\nseparator\nfixed()\n")
+
+    def test_eof_repair_does_not_relax_content_or_explicit_newline_checks(self):
+        cases = [
+            ("old ", "-old\n"),
+            ("first\nlast", "-first\n\\ No newline at end of file\n-last\n"),
+            ("old\n", "-old\n\\ No newline at end of file\n"),
+        ]
+        for source, body in cases:
+            with self.subTest(source=source):
+                patch = "--- a/example.py\n+++ b/example.py\n@@ -1,1 +1,1 @@\n" + body + "+new\n"
+                with self.assertRaisesRegex(DiffError, "missing"):
+                    canonicalize_patch(patch, {"example.py": source})
+
     def test_unknown_source_does_not_gain_fake_application_validation(self):
         patch = unified(CURRENT, BEFORE, "stats.py")
         result = validator_node({

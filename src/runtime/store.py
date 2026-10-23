@@ -86,6 +86,8 @@ class RunStore:
             "schema_version": 1, "run_id": store.run_id, "status": "running",
             "started_at": timestamp(), "code_hash": code_fingerprint(), "input_hash": digest(inputs),
             "mode": inputs["mode"], "scaffold": inputs.get("scaffold", False), "resumes": 0,
+            "review_scope": inputs.get("review_scope", "diff"),
+            "target_file": inputs.get("target_file"),
             "artifacts": {},
         }
         write_json(store.path/"input.json", inputs)
@@ -184,7 +186,8 @@ class RunStore:
                 relative = str(path.relative_to(self.path))
                 artifacts[relative] = {"path": relative, "classification": "source_backup" if path.suffix == ".bak" else "write_receipt",
                                        "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-        self.metadata.update(status=state["status"], mode=state["mode"], finished_at=timestamp(), model_name=state.get("model_name", "unknown"),
+        self.metadata.update(status=state["status"], mode=state["mode"], target_file=state.get("target_file") or self.metadata.get("target_file"),
+                             finished_at=timestamp(), model_name=state.get("model_name", "unknown"),
                              artifacts=artifacts, candidate_valid=bool(eligible),
                              write_status=state.get("write_result", {}).get("status", "not_run"),
                              write_root=state.get("write_root"),
@@ -203,6 +206,8 @@ def publish_run(store, *, report_path, patch_path, test_path, output_root="outpu
     root = Path(output_root)
     with file_lock(store.path/".run.lock"), file_lock(root/".publish.lock", blocking=True):
         current = json.loads((store.path/"manifest.json").read_text())
+        if current.get("target_file") and Path(current["target_file"]).resolve() in targets:
+            raise ValueError("Output paths must not overwrite the reviewed source file; inspect run " + store.run_id)
         if current.get("write_root"):
             protected = {(Path(current["write_root"])/path).resolve() for path in current.get("write_paths", [])}
             if set(targets) & protected:

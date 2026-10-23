@@ -18,6 +18,12 @@ uv pip install --python .venv/bin/python -e .
 
 提供源码上下文时，必须使用输入 diff 对应的改动后版本。程序在创建运行和调用模型前，按 diff 新侧检查已提供文件的内容、行号、换行标记以及新增/删除文件状态；不一致时拒绝执行，CLI 返回退出码 2，不覆盖已有输出。未提供的文件仍可按 diff-only 方式审查。局部 diff 无法证明既有文件在未展示区域也属于同一版本，调用方仍需保证来源一致。
 
+不准备 diff 时，可用 `--target path/to/module.py --task "检查这个文件，有错误就修正。"` 审查并自动写回指定源码，无需指定 mode 或写入开关。`manifest.json` 和结构化结果的 `review_scope=file` 标识整文件范围，`target_file` 记录明确提供的绝对目标。输入保存完整脱敏快照和可用 `auto_write_root` 边界，任务准入决策及有效 `write_root` 进入检查点；恢复复用该版本和已完成决策，不重新读取磁盘替换输入或猜测权限。只审查或只生成补丁的任务不会设置有效写入根。写入前仍核对磁盘版本及历史回执。`--target` 与 `--file` 互斥，报告/补丁输出不能覆盖目标源码。两种范围的质量实验应采用对应的人工缺陷基准，不能把整文件发现当作 diff 新增缺陷评分。
+
+也可以完全不传 target：`code-review "检查 path/to/module.py，有错误就修正"`。此时 `input.json` 只保存原始脱敏请求和项目边界；`task_interpreter` 在 `target_resolution` 阶段提取并验证完整文件引用，读取快照后将真实 `file_paths`、源码哈希、文件内容和任务决策一起提交到检查点。报告及 manifest 记录最终绝对目标，修正直接写入该原文件。`input_hash` 对应初始请求，实际文件版本另由 `source_hashes` 标识；不要把空的初始 `file_contents` 当作没有读取源码。
+
+恢复时，已完成的文件定位和快照不重新执行，后续新增同名文件也不会改变目标。任务解析尚未提交就失败时可以重新执行该节点；已完成定位但检查点丢失或为空时停止，不能用当前文件重建旧运行。纯自然语言目标缺失、不唯一、越界，或任务中含不支持的动作时，不启动下游审查或写入。
+
 终端与报告会给出本次 `Run ID`。默认输出如下：
 
 ```text
@@ -37,7 +43,7 @@ output/
     review.md 或 fix-review.md         本次运行报告
     candidates/repair.diff             通过静态与模型回归验证的候选
     candidates/tests.diff
-    writes/<文件路径哈希>.bak             启用 --write-files 后的原始文件备份，私有文件
+    writes/<文件路径哈希>.bak             任务决定写回时的原始文件备份，私有文件
     writes/<文件路径哈希>.json            对应路径、原始/候选哈希和写入状态回执
     drafts/<SESSION_ID>/attempt-N/     按 patch_generator、test_generator、validator、final 分目录保留快照
 ```
@@ -98,7 +104,7 @@ output/
 .venv/bin/python -m src.cli --resume <RUN_ID> --allow-code-change
 ```
 
-显式启用 `--mode fix --source-root <目录> --write-files` 的运行，会在静态和模型回归通过后调用 write_file。写入前检查全部目标；每个文件先保存原始字节备份和 prepared 回执，再原子替换并标记 written。文件写入节点中断时恢复同一候选，哈希匹配的已完成文件只确认、不重复覆盖。原文件权限与 CRLF 换行保留；新增文件没有旧内容备份。多文件写入不是事务，失败报告的 `write_result` 会显示 partial/unknown 等进度，不能据流程失败推断磁盘未改变。可用 `--inspect <RUN_ID> --node file_writer` 排查。备份不加入公开报告；需要回退时先核对回执中的路径及哈希。写入不执行目标代码或测试。
+自然语言决定写回的运行，会在静态和模型回归通过后调用 write_file。写入前检查全部目标；每个文件先保存原始字节备份和 prepared 回执，再原子替换并标记 written。文件写入节点中断时恢复同一候选，哈希匹配的已完成文件只确认、不重复覆盖。原文件权限与 CRLF 换行保留；新增文件没有旧内容备份。多文件写入不是事务，失败报告的 `write_result` 会显示 partial/unknown 等进度，不能据流程失败推断磁盘未改变。可用 `--inspect <RUN_ID> --node file_writer` 排查。备份不加入公开报告；需要回退时先核对回执中的路径及哈希。写入不执行目标代码或测试。
 
 代码版本、依赖版本、模型名称、原始输入哈希和恢复会话都会留档。检查点反序列化使用明确类型白名单，禁用 pickle。恢复依赖完整可读的本地检查点与输入；损坏的数据库不会被猜测重建。进程在模型响应与检查点提交之间中断时，该请求可能重试，不承诺网络调用恰好执行一次。
 

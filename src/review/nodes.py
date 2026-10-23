@@ -15,7 +15,7 @@ _FOCUS = {
     "bug_detector": "Check control flow, boundary values, null handling, state mutation, exceptions and return values.",
     "security": "Check injection, authorization, unsafe deserialization, hardcoded credentials, data exposure and trust boundaries. Describe redacted credentials without reconstructing them.",
     "code_quality": "Report concrete maintainability costs, duplication and excessive complexity. Avoid subjective style preferences and trivial nitpicks.",
-    "test_coverage": "Find specific changed branches or edge cases with no demonstrated tests. Do not assert measured coverage, and distinguish missing evidence from proven absence.",
+    "test_coverage": "Find specific branches or edge cases within the review scope with no demonstrated tests. Do not assert measured coverage, and distinguish missing evidence from proven absence.",
     "architecture": "Check module responsibilities, dependency direction and coupling using only supplied context.",
     "performance": "Check algorithmic cost, resource leaks, unbounded work and concurrency. Do not invent benchmarks or assume hot paths or call frequency.",
     "dependency": "Check explicit dependency changes and constraints. Do not claim a CVE or current vulnerability without supplied evidence; no external lookup is available.",
@@ -25,6 +25,7 @@ _FOCUS = {
 
 def make_specialist_node(spec: AgentSpec, model, *, react=True) -> NodeHandler:
     def review_node(state: WorkflowState) -> dict:
+        whole_file = state.get("review_scope") == "file"
         changes = {change.path: change for change in parse_diff(state["code_diff"])}
         invoke, options = invoke_json, {}
         payload = {**task_context(state), "diff": state["code_diff"], "file_paths": state["file_paths"], "sources": state.get("file_contents", {}),
@@ -37,7 +38,10 @@ def make_specialist_node(spec: AgentSpec, model, *, react=True) -> NodeHandler:
         reply = invoke(
             model, spec.id,
             f"You review {spec.responsibility}. {_FOCUS[spec.id]} "
-            "Report only actionable issues introduced by this diff. Use target-side line numbers. "
+            + ("Review actionable existing defects in the complete current file, including syntax errors. "
+               "The context-only diff encodes an existing file snapshot, not a change or a new file. "
+               if whole_file else "Report only actionable issues introduced by this diff. ")
+            + "Use target-side line numbers. "
             "Evidence must be an exact nonempty excerpt from this file's supplied diff or source. "
             "Use an empty findings list when no issue is supported. Do not invent missing context. "
             "Respect declared types and documented contracts: invalid-type inputs are not defects unless a supplied caller or contract requires them. "
@@ -62,7 +66,8 @@ def make_specialist_node(spec: AgentSpec, model, *, react=True) -> NodeHandler:
                 ))
                 seen.add(finding_id)
         # Free-form model summaries have no per-claim evidence contract.
-        summary = f"{len(findings)} candidate finding(s). Scope: supplied diff/source only; no repository-wide test or runtime checks."
+        scope = "complete supplied file" if whole_file else "supplied diff/source only"
+        summary = f"{len(findings)} candidate finding(s). Scope: {scope}; no repository-wide test or runtime checks."
         return {"reports": {spec.id: AgentReport(spec.id, "completed", tuple(findings), summary)}}
 
     return review_node
@@ -78,7 +83,10 @@ def adjudicator_node(state: WorkflowState, model) -> dict:
     reply = invoke_json(
         model, "adjudicator",
         "Evaluate every candidate against the supplied code. Return exactly one decision per ID. "
-        "Confirm only evidence-supported introduced issues; keep uncertainty as candidate, reject false positives. "
+        + ("For file scope, confirm evidence-supported existing defects in the supplied current file, "
+           "including syntax errors; the context-only diff is not a change comparison. "
+           if state.get("review_scope") == "file" else "Confirm only evidence-supported introduced issues. ")
+        + "Keep uncertainty as candidate, reject false positives. "
         "Rewrite each title, description and suggestion to remove unsupported secondary claims, including invalid-type inputs outside declared contracts, "
         "assumed hot paths and repository-wide test absence. Reject a candidate if its core claim is unsupported. "
         "Assign severity independently of specialist votes and provide severity_reason: low for minor costs, medium for limited functional defects, "

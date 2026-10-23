@@ -88,11 +88,13 @@ def _write_output(path: Path, text: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="code-review", description="Multi-agent review and candidate repair with built-in ReAct.")
+    parser.add_argument("request", nargs="?", help="Natural-language task containing a file path or unique filename")
     inputs = parser.add_mutually_exclusive_group()
     inputs.add_argument("--branch", metavar="REF", help="Review changes from REF to HEAD")
     inputs.add_argument("--commit", metavar="SHA", help="Review one commit, including a root commit")
     inputs.add_argument("--unstaged", action="store_true", help="Review unstaged changes (default: staged)")
     inputs.add_argument("--file", metavar="PATH", help="Read a unified diff file")
+    inputs.add_argument("--target", metavar="PATH", help="Review or fix an existing source file; no diff file required")
     inputs.add_argument("--resume", metavar="RUN_ID", help="Resume a failed/interrupted persisted run")
     inputs.add_argument("--inspect", metavar="RUN_ID", help="Inspect a saved run and its diagnostics without model calls")
     parser.add_argument("--run-root", default="output/runs", help="Private run history and checkpoints (default: output/runs)")
@@ -105,8 +107,9 @@ def main() -> None:
     parser.add_argument("--mode", choices=("review", "fix"), help="Execution mode (default without --task: review)")
     parser.add_argument("--agents", nargs="+", choices=AGENT_IDS, help="Specialists to run (default: all eight)")
     parser.add_argument("--max-fix-attempts", type=int, default=2)
-    parser.add_argument("--source-root", help="Explicitly read changed CURRENT source files under this directory")
-    parser.add_argument("--write-files", action="store_true", help="Write validated fix candidates under --source-root, preserving backups")
+    parser.add_argument("--source-root", help="Source boundary for changed files or --target (target default: current directory)")
+    # Retain old commands; natural-language goals now decide writes by default.
+    parser.add_argument("--write-files", action="store_true", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
     parser.add_argument("--output", metavar="PATH", help="Report path (default: ./output/review.md or fix-review.md; .json with --format json)")
     parser.add_argument("--patch-output", metavar="PATH", help="Code patch path (default in fix mode: ./output/repair.diff); does not apply it")
@@ -115,10 +118,18 @@ def main() -> None:
     parser.add_argument("--graph", action="store_true", help="Print the Mermaid graph without a model or diff")
     args = parser.parse_args()
     try:
+        if args.request is not None:
+            if args.task is not None:
+                raise ValueError("Provide one natural-language request, either positional or --task")
+            args.task = args.request
         if args.max_fix_attempts < 1:
             raise ValueError("--max-fix-attempts must be positive")
         if args.task is not None and (args.graph or args.inspect or args.resume or args.scaffold):
             raise ValueError("--task requires a new model workflow; cannot combine with graph/inspect/resume/scaffold")
+        if args.target and args.graph:
+            raise ValueError("--target cannot combine with --graph")
+        if args.target and args.source_root is None:
+            args.source_root = "."
         if args.write_files and ((args.mode != "fix" and args.task is None) or not args.source_root or args.scaffold or args.graph or args.inspect or args.resume):
             raise ValueError("--write-files requires --mode fix and --source-root, without scaffold/graph/inspect/resume")
         if args.inspect:
@@ -145,6 +156,24 @@ def main() -> None:
             from src.workflow.graph import build_workflow_graph
             text = build_workflow_graph().get_graph().draw_mermaid()
             result = None
+        elif args.target:
+            from src.workflow.service import run_file_workflow
+            result = run_file_workflow(
+                args.target, source_root=args.source_root, write_files=args.write_files,
+                mode=args.mode, active_agents=args.agents, task=args.task,
+                max_fix_attempts=args.max_fix_attempts, scaffold=args.scaffold, run_root=args.run_root,
+            )
+            args.mode = result["mode"]
+            text = to_json(result) if args.format == "json" else result["final_review"]
+        elif args.task is not None and not (args.file or args.branch or args.commit or args.unstaged):
+            from src.workflow.service import run_task_workflow
+            result = run_task_workflow(
+                args.task, source_root=args.source_root or ".", run_root=args.run_root,
+                mode=args.mode, active_agents=args.agents, max_fix_attempts=args.max_fix_attempts,
+                write_files=args.write_files,
+            )
+            args.mode = result["mode"]
+            text = to_json(result) if args.format == "json" else result["final_review"]
         else:
             diff, paths = _get_diff_and_files(args)
             if not diff:
@@ -159,6 +188,7 @@ def main() -> None:
                 file_contents=_read_sources(paths, args.source_root),
                 run_root=args.run_root,
                 write_root=args.source_root if args.write_files else None,
+                auto_write_root=args.source_root if args.task is not None and args.write_files is None else None,
             )
             args.mode = result["mode"]
             text = to_json(result) if args.format == "json" else result["final_review"]

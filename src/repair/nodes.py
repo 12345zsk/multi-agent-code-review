@@ -26,7 +26,7 @@ def fix_planner_node(state: WorkflowState, model) -> dict:
     reply = invoke_json(
         model, "fix_planner",
         "Plan minimal changes for all supplied confirmed fixable findings. Reference every supplied ID exactly once. "
-        "Use the post-change sources as the repair baseline; do not revert unrelated changes. "
+        "Use the supplied current sources as the repair baseline; do not revert unrelated changes. "
         "Incorporate any previous static-validation or regression feedback. Do not claim checks were executed.",
         _repair_input(state), PlanReply,
     )
@@ -39,9 +39,11 @@ def fix_planner_node(state: WorkflowState, model) -> dict:
 def patch_generator_node(state: WorkflowState, model) -> dict:
     reply = invoke_json(
         model, "patch_generator",
-        "Generate a minimal unified code diff against the supplied post-change baseline. "
+        "Generate a minimal unified code diff against the supplied current source baseline. "
         "Use --- a/path and +++ b/path headers and exact @@ line counts, with LF newlines. "
-        "Modify only files in the reviewed diff; do not generate tests in this step. "
+        "Include \\ No newline at end of file after any old or new line that lacks a final newline. "
+        "Modify only files in the reviewed scope; do not generate tests in this step. "
+        "In file scope, the context-only input diff is a snapshot of an existing file; do not recreate it as a new file. "
         "Cover exactly the plan finding IDs. Do not embed credentials or unrelated refactoring. "
         "Return the complete candidate patch for this attempt, not an incremental patch over a previous attempt.",
         {**_repair_input(state), "plan": asdict(state["fix_plan"])}, PatchReply,

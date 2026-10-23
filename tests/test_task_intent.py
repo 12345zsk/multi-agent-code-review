@@ -122,11 +122,11 @@ class TaskIntentTests(unittest.TestCase):
                 self.assertEqual(len(model.calls), 1)
                 self.assertNotIn("patch", result)
 
-    def test_request_to_write_cannot_implicitly_authorize_file_writes(self):
+    def test_request_to_write_requires_a_known_source_boundary(self):
         model = TaskModel(accepted(mode="fix", write_policy="required"))
         result = self.run_task(model, task="修正缺陷并直接修改本地文件")
         self.assertEqual(result["status"], "needs_clarification")
-        self.assertIn("--write-files", result["final_review"])
+        self.assertIn("源码边界", result["final_review"])
         self.assertEqual(len(model.calls), 1)
         self.assertEqual(result["write_result"]["status"], "not_run")
 
@@ -251,7 +251,7 @@ class TaskCliTests(unittest.TestCase):
     def test_natural_fix_without_mode_publishes_correct_report_and_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            status, out, err = self.invoke(root, TaskModel(accepted(mode="fix")), "--task", "审查并生成缺陷修正补丁，不写入原文件")
+            status, out, err = self.invoke(root, TaskModel(accepted(mode="fix", write_policy="forbidden")), "--task", "审查并生成缺陷修正补丁，不写入原文件")
             self.assertEqual(status, 0, err)
             self.assertIn("Mode: fix", out)
             self.assertTrue((root/"output/fix-review.md").exists())
@@ -278,11 +278,11 @@ class TaskCliTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "unsupported")
             self.assertFalse(manifest["candidate_valid"])
 
-    def test_natural_fix_with_explicit_write_permission_uses_guarded_writer(self):
+    def test_natural_fix_automatically_uses_guarded_writer_without_write_flag(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             status, out, err = self.invoke(root, TaskModel(accepted(mode="fix", write_policy="required")),
-                                           "--task", "修正缺陷并写回本地文件", "--write-files")
+                                           "--task", "修正缺陷并写回本地文件")
             self.assertEqual(status, 0, err)
             self.assertEqual((root/"stats.py").read_text(), BEFORE)
             self.assertTrue((root/"tests/test_stats.py").exists())
