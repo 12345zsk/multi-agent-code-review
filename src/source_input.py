@@ -7,7 +7,7 @@ from src.config import MAX_DIFF_CHARS
 from src.diff import safe_path
 
 MAX_SEARCH_ENTRIES = 10000
-_SEARCH_SKIP = {".git", ".venv", "venv", "__pycache__", "output", "logs", "node_modules", "build", "dist"}
+_SEARCH_SKIP = {".git", ".venv", "venv", "__pycache__", "output", "generated_tests", "logs", "node_modules", "build", "dist"}
 
 
 def explicit_reference(task: str, reference: str) -> bool:
@@ -66,6 +66,35 @@ def source_snapshot(path: str, source: str) -> str:
         if not line.endswith("\n"):
             result.append("\n\\ No newline at end of file\n")
     return "".join(result)
+
+
+def read_referenced_targets(references, source_root, *, run_root=None):
+    """Resolve explicit files or expand explicit directories within a bounded scope."""
+    from src.project_tools import project_inventory
+    root = Path(source_root).resolve(strict=True)
+    sources = {}
+    for reference in references:
+        requested = Path(reference).expanduser()
+        target = requested if requested.is_absolute() else root/requested
+        if target.is_dir():
+            relative = target.relative_to(root).as_posix()
+            if relative != ".":
+                safe_path(relative)
+            prefix = "" if relative == "." else relative.rstrip("/")+"/"
+            catalog = project_inventory(root, run_root)
+            paths = [p for p in catalog if p.startswith(prefix) and Path(p).suffix.lower() in
+                     {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".c", ".h", ".cpp"}]
+            if not paths:
+                raise ValueError("指定目录中没有可审查的源码文件。")
+        else:
+            _, path, source = read_referenced_target(reference, root, run_root=run_root)
+            paths = [path]
+        for path in paths:
+            if len(sources) >= 20 and path not in sources:
+                raise ValueError("目标超过 20 个文件，请缩小审查目录。")
+            _, _, source = read_target(path, root, run_root=run_root)
+            sources[path] = source
+    return root, sources
 
 
 def read_target(file_path: str | Path, source_root: str | Path, *, run_root=None) -> tuple[Path, str, str]:

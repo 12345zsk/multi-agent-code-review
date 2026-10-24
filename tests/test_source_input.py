@@ -15,7 +15,7 @@ from code_review import run_file_workflow
 from examples.repair_demo import BEFORE, CURRENT, DemoModel, SAMPLE_DIFF, unified
 from src.cli import main
 from src.diff import apply_patch, parse_diff, validate_source_context
-from src.source_input import read_target, source_snapshot
+from src.source_input import read_referenced_target, read_target, source_snapshot
 from src.workflow.service import resume_workflow, run_workflow
 
 
@@ -31,7 +31,7 @@ class SourceModel(DemoModel):
             assert payload["review_scope"] == "file"
             assert Path(payload["target_file"]).is_absolute()
             return AIMessage(content=json.dumps({
-                "status": "accepted", "mode": "fix", "agents": ["bug_detector"],
+                "status": "accepted", "mode": "fix", "agents": None,
                 "guidance": "审查并修正确认的缺陷，保留正常输入行为。",
                 "write_policy": "required" if payload["writes_available"] else "optional",
                 "unsupported_requests": [], "reason": "明确的指定源码文件修正任务。",
@@ -40,6 +40,19 @@ class SourceModel(DemoModel):
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_basename_lookup_skips_generated_tests_but_explicit_paths_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"examples").mkdir()
+            (root/"generated_tests").mkdir()
+            (root/"examples/test_stats.py").write_text(CURRENT)
+            (root/"generated_tests/test_stats.py").write_text("# Generated regression artifact.\n")
+            _, path, source = read_referenced_target("test_stats.py", root)
+            self.assertEqual(path, "examples/test_stats.py")
+            self.assertEqual(source, CURRENT)
+            _, path, _ = read_referenced_target("generated_tests/test_stats.py", root)
+            self.assertEqual(path, "generated_tests/test_stats.py")
+
     def test_snapshot_covers_current_file_without_inventing_a_change(self):
         for source in (CURRENT, CURRENT.rstrip("\n"), "", "\n", "x = 1\n\ny = 2"):
             with self.subTest(source=repr(source)):
@@ -110,6 +123,7 @@ class SourceWorkflowTests(unittest.TestCase):
             self.assertEqual(result["candidate_files"]["stats.py"], BEFORE)
             self.assertEqual((root/"stats.py").read_text(), CURRENT)
             self.assertFalse((root/"tests").exists())
+            self.assertFalse((root/"generated_tests").exists())
 
     def test_fix_writes_correct_target_with_original_byte_backup_and_crlf(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -162,7 +176,7 @@ class SourceWorkflowTests(unittest.TestCase):
             root = Path(directory)
             (root/"target.py").write_text(source)
             result = run_file_workflow("target.py", source_root=root, mode="fix", model=SyntaxModel(),
-                                       write_files=True, run_root=root/"runs", active_agents=["bug_detector"])
+                                       write_files=True, run_root=root/"runs")
             self.assertEqual(result["status"], "proposed")
             self.assertEqual(result["validation"].status, "passed")
             self.assertEqual((root/"target.py").read_text(), repaired)

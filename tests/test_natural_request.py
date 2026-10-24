@@ -33,7 +33,7 @@ class RequestModel(DemoModel):
             admitted = self.outcome == "accepted"
             return AIMessage(content=json.dumps({
                 "status": self.outcome, "mode": self.mode if admitted else None,
-                "agents": ["bug_detector"] if admitted else None,
+                "agents": None,
                 "guidance": "检查指定源码，遵守空输入返回零的契约。" if admitted else None,
                 "write_policy": self.policy if admitted else None,
                 "target": self.target if admitted else None,

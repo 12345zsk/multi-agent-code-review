@@ -55,11 +55,11 @@ class TaskIntentTests(unittest.TestCase):
         self.assertEqual(result["mode"], "review")
         self.assertEqual(set(result["reports"]), set(AGENT_IDS))
         self.assertNotIn("patch", result)
-        self.assertIn(model.decision["guidance"], result["final_review"])
+        self.assertIn("审查变更，重点检查空输入。", result["final_review"])
         self.assertEqual(model.calls[0][0], "task_interpreter")
         for role, payload in model.calls[1:]:
-            self.assertIn(role, (*AGENT_IDS, "adjudicator"))
-            self.assertEqual(payload["task_guidance"], model.decision["guidance"])
+            self.assertIn(role, (*AGENT_IDS, "adjudicator", "review_planner"))
+            self.assertEqual(payload["task_guidance"], "审查变更，重点检查空输入。")
         self.assertNotIn("user_task", json.loads(to_json(result)))
 
     def test_task_selects_fix_without_mode_flag_and_guides_all_repair_roles(self):
@@ -71,14 +71,32 @@ class TaskIntentTests(unittest.TestCase):
         self.assertEqual(result["runtime_validation"].status, "not_run")
         for role in ("fix_planner", "patch_generator", "test_generator", "regression_reviewer"):
             payload = next(payload for name, payload in model.calls if name == role)
-            self.assertEqual(payload["task_guidance"], model.decision["guidance"])
+            self.assertEqual(payload["task_guidance"], "修正空输入缺陷，正常列表行为必须保持不变。")
 
-    def test_explicit_specialist_request_is_respected(self):
-        model = TaskModel(accepted(agents=["security"]))
+    def test_interpreter_cannot_add_expert_priorities_to_original_task(self):
+        task = "只审查 stats.py，不要修改文件"
+        invented = "全面覆盖安全、逻辑、质量、测试、架构、性能、依赖、兼容性，执行全部专家。"
+        model = TaskModel(accepted(guidance=invented, write_policy="forbidden"))
+        result = self.run_task(model, task=task)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["task_intent"]["guidance"], task)
+        self.assertNotIn("specialists", model.calls[0][1])
+        self.assertNotIn(invented, result["final_review"])
+        for role, payload in model.calls[1:]:
+            self.assertEqual(payload["task_guidance"], task, role)
+
+    def test_long_admitted_task_preserves_explicit_priorities_without_truncation(self):
+        task = "审查变更，重点检查兼容性；" + "保留现有接口。"*300
+        result = self.run_task(TaskModel(), task=task)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["task_intent"]["guidance"], task)
+
+    def test_specialty_priority_does_not_override_dynamic_dispatch(self):
+        model = TaskModel(accepted(guidance="重点检查安全，同时按实际风险动态分工。"))
         result = self.run_task(model, task="只让安全专家审查本次变更。")
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["active_agents"], ["security"])
-        self.assertEqual(set(result["reports"]), {"security"})
+        self.assertTrue(result["review_plan"])
+        self.assertIn("review_planner", [role for role, _ in model.calls])
 
     def test_out_of_scope_and_mixed_requests_never_start_an_alternative_task(self):
         for task, unsupported in (
@@ -110,10 +128,9 @@ class TaskIntentTests(unittest.TestCase):
         self.assertIn("请明确", result["final_review"])
         self.assertEqual(result["reports"], {})
 
-    def test_explicit_mode_and_agent_conflicts_stop_before_review(self):
+    def test_explicit_mode_conflicts_stop_before_review(self):
         for decision, options in (
             (accepted(mode="fix"), {"mode": "review"}),
-            (accepted(agents=["security"]), {"active_agents": ["bug_detector"]}),
         ):
             with self.subTest(options=options):
                 model = TaskModel(decision)
@@ -285,7 +302,7 @@ class TaskCliTests(unittest.TestCase):
                                            "--task", "修正缺陷并写回本地文件")
             self.assertEqual(status, 0, err)
             self.assertEqual((root/"stats.py").read_text(), BEFORE)
-            self.assertTrue((root/"tests/test_stats.py").exists())
+            self.assertEqual(len(list((root/"generated_tests").glob("test_stats__run_*.py"))), 1)
             self.assertIn("Status: written", out)
 
 

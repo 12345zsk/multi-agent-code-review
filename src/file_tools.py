@@ -102,6 +102,8 @@ class CandidateWriter:
             if not already_written and previous.get("status") == "written":
                 raise FileWriteError("FILE_VERSION_CHANGED")
         if not already_written:
+            if baseline is None and original is not None:
+                raise FileWriteError("WRITE_NEW_FILE_EXISTS")
             try:
                 current = original.decode("utf-8") if original is not None else None
             except UnicodeError:

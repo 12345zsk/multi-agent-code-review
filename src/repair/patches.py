@@ -1,6 +1,7 @@
 """Canonicalize model diffs using exact supplied context, never fuzzy matching."""
 
 from dataclasses import replace
+from pathlib import PurePosixPath
 import difflib
 import re
 
@@ -112,3 +113,27 @@ def canonicalize_patch(text: str, sources: dict[str, str]) -> str:
 def _body_text(lines: tuple[tuple[str, str], ...]) -> str:
     return "".join(kind + content if content.endswith("\n") else kind + content + "\n\\ No newline at end of file\n"
                    for kind, content in lines)
+
+
+def scope_new_tests(text: str, suffix: str = "") -> str:
+    """Keep generated tests outside framework tests, with stable per-run Python names.
+
+    Call only after canonicalization and test path scope checks. Existing-file
+    edits keep their baseline paths; repeated validation keeps the same names.
+    """
+    output = []
+    changed = False
+    for change in parse_diff(text):
+        path = PurePosixPath(change.path)
+        if change.old_path is None:
+            if suffix and path.suffix == ".py" and not path.stem.endswith(suffix):
+                path = path.with_name(path.stem + suffix + path.suffix)
+            destination = str(PurePosixPath("generated_tests") / path.name)
+            changed = changed or destination != change.new_path
+            change = replace(change, new_path=destination)
+        output.append(f"--- {'a/' + change.old_path if change.old_path else '/dev/null'}\n"
+                      f"+++ {'b/' + change.new_path if change.new_path else '/dev/null'}\n")
+        for hunk in change.hunks:
+            output.append(f"@@ -{hunk.old_start},{hunk.old_count} +{hunk.new_start},{hunk.new_count} @@\n")
+            output.append(_body_text(hunk.lines))
+    return "".join(output) if changed else text

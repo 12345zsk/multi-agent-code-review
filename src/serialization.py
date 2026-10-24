@@ -26,5 +26,5 @@ def to_json(state: dict) -> str:
     # Raw inputs and full candidate source are not part of exported reports.
     return json.dumps(to_data({
         key: value for key, value in state.items()
-        if key not in {"code_diff", "file_contents", "context", "candidate_files", "previous_attempt", "user_task"}
+        if key not in {"code_diff", "file_contents", "observed_sources", "project_inventory", "context", "candidate_files", "previous_attempt", "user_task"}
     }), ensure_ascii=False, indent=2)

@@ -45,6 +45,7 @@ class AgentReport:
     status: Literal["pending", "completed", "failed"] = "pending"
     findings: tuple[Finding, ...] = ()
     summary: str = ""
+    tool_observations: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -77,10 +78,12 @@ class ValidationResult:
 
 
 class WorkflowState(TypedDict, total=False):
+    workflow_version: int
     run_id: str
     run_dir: str
     input_hash: str
     source_hashes: dict[str, str]
+    context_hashes: dict[str, str]
     model_name: str
     react: bool
     write_root: str | None
@@ -96,16 +99,24 @@ class WorkflowState(TypedDict, total=False):
     resolve_target: bool
     source_root: str
     run_history_root: str | None
-    target_reference: str
+    target_reference: str | list[str]
     user_task: str
     requested_mode: Literal["review", "fix"] | None
-    requested_agents: list[str] | None
     task_intent: dict
     active_agents: list[str]
+    review_plan: list[dict]
+    project_inventory: dict
+    observed_sources: Annotated[dict[str, dict[str, str]], operator.or_]
+    review_disputes: list[dict]
+    dispute_reviews: list[dict]
+    review_round: int
+    failure_diagnosis: dict
+    failure_diagnoses: list[dict]
+    target_files: list[str]
     context: dict[str, str]
     file_contents: dict[str, str]
     candidate_files: dict[str, str]
-    previous_attempt: dict[str, str]
+    previous_attempt: dict
     # Independent parallel branches own distinct agent IDs. Retry stages do not
     # append old findings; the adjudicator replaces the canonical findings list.
     reports: Annotated[dict[str, AgentReport], operator.or_]

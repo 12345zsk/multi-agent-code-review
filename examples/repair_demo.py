@@ -50,7 +50,19 @@ class DemoModel:
     def invoke(self, messages):
         role = messages[0].content.splitlines()[0].removeprefix("ROLE: ")
         payload = json.loads(messages[1].content)
-        if role == "bug_detector":
+        if role == "review_planner":
+            from src.workflow.registry import REVIEW_AGENTS
+            data = {"assignments": [{"agent_id": s.id, "reason": "Synthetic orchestration fixture: " + s.responsibility,
+                                     "questions": ["Check the supplied contract within this specialty."]} for s in REVIEW_AGENTS]}
+        elif role == "failure_diagnoser":
+            data = {"category": "code_patch", "action": "retry" if payload["remaining_attempts"] else "stop",
+                    "summary": "Synthetic diagnosis of failed candidate validation.",
+                    "instructions": "Use exact supplied baseline context and incorporate validation/regression feedback."}
+        elif role == "dispute_reviewer":
+            data = {"resolutions": [{"finding_id": item["id"], "status": "candidate",
+                                      "reason": "Synthetic recheck preserves uncertainty for adjudication.",
+                                      "evidence": item["evidence"]} for item in payload["candidates"]]}
+        elif role == "bug_detector":
             data = {"summary": "Empty input now divides by zero.", "findings": [{
                 "title": "Empty input divides by zero", "description": "The removed guard violates the documented empty-list contract.",
                 "file_path": "stats.py", "line": 3, "severity": "high", "fixable": True,

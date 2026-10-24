@@ -49,18 +49,14 @@
 - 审查加修正：`output/fix-review.md`、`output/repair.diff`、`output/tests.diff`；补丁仅在产生非空候选时写出。
 - 添加 `--format json` 后，报告自动改为 `output/review.json` 或 `output/fix-review.json`。
 
-`--output`、`--patch-output`、`--test-output` 仍可分别指定其他路径，并自动创建父目录。旧命令中显式指定的 `/tmp/...` 会覆盖默认目录；要使用 `output/`，请省略这些路径参数或改为 `output/...`。要减少模型调用量，可在任一命令中添加：
-
-```bash
---agents bug_detector security code_quality test_coverage
-```
+`--output`、`--patch-output`、`--test-output` 仍可分别指定其他路径，并自动创建父目录。旧命令中显式指定的 `/tmp/...` 会覆盖默认目录；要使用 `output/`，请省略这些路径参数或改为 `output/...`。专家由动态规划选择，报告记录理由和审查问题；已移除手动 --agents 参数。
 
 ## 人工验收
 
 - 审查完成时通常为 `completed`；检查五类问题的证据、定位、确认状态和误报，而不只看发现数量。
 - 修正候选成功时应为 `proposed`。提供完整源文件后，`validation` 应列出内存应用和 Python 语法检查结果，`regression` 展示模型回归判断。
 - `runtime_validation` 始终为 `not_run`。人工审阅候选后，再在隔离副本中应用和运行测试。
-- Python 测试补丁使用标准库 `unittest`。在隔离副本应用代码及测试补丁后，用 `python -m unittest discover -s tests -p 'test_review_target.py' -v` 执行生成的测试，不需要安装 pytest。
+- Python 测试补丁使用标准库 `unittest`。在隔离副本应用代码及测试补丁后，用 `python -m unittest discover -s generated_tests -p '报告中的测试文件名.py' -v` 执行生成的测试，不需要安装 pytest。
 - 若状态为 `failed` 或 `incomplete`，检查本次报告，不把遗留产物或部分补丁当作通过。
 
 修改样例后，可在项目根目录重新生成输入 diff：

@@ -7,9 +7,10 @@ def context_collector_node(state: WorkflowState) -> dict:
     """Organize caller-supplied context without reading any repository files."""
     import json
     from src.diff import parse_diff
+    from src.project_tools import project_inventory
 
     changes = parse_diff(state["code_diff"])
-    return {"context": {
+    return {"project_inventory": project_inventory(state.get("source_root"), state.get("run_history_root")), "context": {
         "diff": state["code_diff"],
         "files": json.dumps([
             {"path": change.path, "hunks": len(change.hunks), "target_lines": sorted(change.target_lines())}
@@ -18,9 +19,34 @@ def context_collector_node(state: WorkflowState) -> dict:
     }}
 
 
-def review_planner_node(state: WorkflowState) -> dict:
-    """Keep the explicit selection; the service defaults to all specialists."""
-    return {"active_agents": state["active_agents"]}
+def review_planner_node(state: WorkflowState, model) -> dict:
+    """Select specialists and concrete questions from code risks, never caller IDs."""
+    from src.project_tools import react_options
+    from src.react import invoke_react_json
+    from src.schemas import ReviewPlanReply
+    from src.model_agent import invoke_json
+    from src.task_intent import task_context
+    from src.workflow.registry import REVIEW_AGENTS
+    observed = {}
+    invoke = invoke_react_json if state.get("react", True) else invoke_json
+    options = react_options(state, observed) if state.get("react", True) else {}
+    reply = invoke(model, "review_planner",
+        "Plan an evidence-driven code review. Select only specialists justified by the actual code, "
+        "interfaces, configuration, and task risks; never default to every specialist. "
+        "The user may express priorities, but does not choose the dispatch list. "
+        "Inspect related files with project tools when needed. Give a concrete reason and actionable "
+        "review questions for every selected specialist. Select at least one specialist. "
+        "Select test_coverage for contracts requiring verification, not an assumed absence of tests: "
+        "inventories, zero matches, truncated searches and unavailable files cannot prove absent tests. "
+        "Do not use hidden defect labels or invent source context.",
+        {**task_context(state), "diff": state["code_diff"], "file_paths": state["file_paths"],
+         "project_files": list(state.get("project_inventory", {}))[:200],
+         "project_inventory_truncated": len(state.get("project_inventory", {})) > 200,
+         "specialists": {s.id: s.responsibility for s in REVIEW_AGENTS}}, ReviewPlanReply,
+        **options)
+    assignments = [item.model_dump() for item in reply.assignments]
+    return {"review_plan": assignments, "active_agents": [item.agent_id for item in reply.assignments],
+            "observed_sources": {"review_planner": observed}}
 
 
 def reporter_node(state: WorkflowState) -> dict:
@@ -35,7 +61,7 @@ def reporter_node(state: WorkflowState) -> dict:
         if intent.get("unsupported_requests"):
             lines.extend(["", "不支持的要求：", *["- " + item for item in intent["unsupported_requests"]]])
         lines.extend(["", "本次未执行代码审查、修正或文件写入。",
-                      "当前支持：审查提供的 diff 或显式指定的源码文件、修正确认的缺陷、生成候选回归测试及静态/模型验证。",
+                      "当前支持：审查 diff、明确指定的多个文件或目录，检索项目上下文，修正确认的缺陷、生成候选回归测试及静态/模型验证。",
                       "自然语言明确要求修正本地文件时，可校验、备份后写回；不支持运行目标测试、联网、部署或新功能开发。"])
         return {"status": intent["status"], "final_review": redact("\n".join(lines))}
 
@@ -67,10 +93,14 @@ def reporter_node(state: WorkflowState) -> dict:
     status = "failed" if failed else "incomplete" if incomplete else "proposed" if proposing else "completed"
     confirmed = [f for f in findings if f.status == "confirmed"]
     uncertain = [f for f in findings if f.status == "candidate"]
+    limited_roles = sorted({event["node"] for event in state.get("trace_events", [])
+                            if event["event"] == "react_finalization"})
     if status in {"failed", "incomplete"} or uncertain:
         verdict = "NEEDS DISCUSSION"
     elif any(f.severity in {"critical", "high", "medium"} for f in confirmed):
         verdict = "REQUEST CHANGES"
+    elif limited_roles:
+        verdict = "NEEDS DISCUSSION"
     else:
         verdict = "APPROVE"
     lines = [
@@ -80,7 +110,7 @@ def reporter_node(state: WorkflowState) -> dict:
         "", "## Review coverage",
     ]
     if state.get("react"):
-        lines.insert(4, "Review strategy: ReAct | Tool: read_source (input snapshot only)")
+        lines.insert(4, "Review strategy: ReAct | Tools: list_project_files, search_code, read_source, analyze_python (bounded project access)")
     if state.get("review_scope") == "file":
         lines.insert(4, "Review scope: full source file | Target: " + ", ".join(state["file_paths"]))
     if intent.get("status") == "accepted":
@@ -90,6 +120,28 @@ def reporter_node(state: WorkflowState) -> dict:
     for agent in state["active_agents"]:
         report = reports.get(agent)
         lines.append(f"- {agent}: {report.status if report else 'missing'} — {report.summary if report else ''}")
+        if report:
+            truncated = sum(bool(check.get("truncated")) for check in report.tool_observations)
+            unavailable = {path for check in report.tool_observations for path in check.get("unavailable", [])}
+            if truncated or unavailable:
+                lines.append(f"  Evidence limits: {truncated} truncated tool result(s), "
+                             f"{len(unavailable)} unavailable file(s); missing matches do not prove absent tests.")
+    if limited_roles:
+        lines.extend(["", "Context collection limited by the ReAct budget: " + ", ".join(limited_roles) + ".",
+                      "Results use collected evidence only; unverified questions remain uncertain. "
+                      "This does not establish complete review or test coverage."])
+    if state.get("review_plan"):
+        lines.extend(["", "## Dynamic review plan"])
+        for assignment in state["review_plan"]:
+            lines.append(f"- {assignment['agent_id']}: {assignment['reason']}")
+            lines.extend("  - " + question for question in assignment["questions"])
+    if state.get("dispute_reviews"):
+        lines.extend(["", "## Targeted dispute review"])
+        lines.extend(f"- {r['agent_id']} / {r['finding_id']}: {r['status']} — {r['reason']}" for r in state["dispute_reviews"])
+    if state.get("failure_diagnoses"):
+        lines.extend(["", "## Repair failure diagnoses"])
+        lines.extend(f"- Attempt {d['attempt']}: {d['category']} / {d['action']} — {d['summary']}\n  {d['instructions']}"
+                     for d in state["failure_diagnoses"])
     lines.extend(["", "## Findings"])
     for finding in findings:
         if finding.status == "rejected":
@@ -108,7 +160,9 @@ def reporter_node(state: WorkflowState) -> dict:
                 f"  Critical exposure evidence: {finding.critical_exposure_evidence}",
             ])
     if not any(f.status != "rejected" for f in findings):
-        lines.append("No supported issues found in the selected review scope." if status == "completed" else "No confirmed result; review is incomplete.")
+        lines.append(("No supported issues found in the collected evidence." if limited_roles
+                      else "No supported issues found in the selected review scope.")
+                     if status == "completed" else "No confirmed result; review is incomplete.")
     lines.extend(["", f"Fix attempts: {state['fix_attempts']}"])
     if state.get("fix_plan"):
         lines.extend(["", "## Repair plan", state["fix_plan"].description])

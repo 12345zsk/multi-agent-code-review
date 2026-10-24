@@ -25,7 +25,7 @@ class IntentModel(DemoModel):
             admitted = self.outcome == "accepted"
             return AIMessage(content=json.dumps({
                 "status": self.outcome, "mode": self.mode if admitted else None,
-                "agents": ["bug_detector"] if admitted else None,
+                "agents": None,
                 "guidance": "按用户要求审查本地文件并保持原有契约。" if admitted else None,
                 "write_policy": self.policy if admitted else None,
                 "unsupported_requests": ["部署上线"] if self.outcome == "unsupported" else [],

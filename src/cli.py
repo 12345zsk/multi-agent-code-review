@@ -11,7 +11,6 @@ from src.config import MAX_DIFF_CHARS
 from src.diff import parse_diff
 from src.privacy import redact
 from src.serialization import to_json
-from src.workflow.registry import AGENT_IDS
 
 
 def _run_git(*args: str) -> str:
@@ -88,7 +87,7 @@ def _write_output(path: Path, text: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="code-review", description="Multi-agent review and candidate repair with built-in ReAct.")
-    parser.add_argument("request", nargs="?", help="Natural-language task containing a file path or unique filename")
+    parser.add_argument("request", nargs="?", help="Natural-language task containing explicit file or directory paths")
     inputs = parser.add_mutually_exclusive_group()
     inputs.add_argument("--branch", metavar="REF", help="Review changes from REF to HEAD")
     inputs.add_argument("--commit", metavar="SHA", help="Review one commit, including a root commit")
@@ -105,9 +104,8 @@ def main() -> None:
     parser.add_argument("--phase", help="Filter --inspect by execution phase")
     parser.add_argument("--task", help="Natural-language review/repair goal; unsupported or unclear requests stop before execution")
     parser.add_argument("--mode", choices=("review", "fix"), help="Execution mode (default without --task: review)")
-    parser.add_argument("--agents", nargs="+", choices=AGENT_IDS, help="Specialists to run (default: all eight)")
     parser.add_argument("--max-fix-attempts", type=int, default=2)
-    parser.add_argument("--source-root", help="Source boundary for changed files or --target (target default: current directory)")
+    parser.add_argument("--source-root", help="Authorized project boundary for targets and read-only context (natural task/target default: current directory)")
     # Retain old commands; natural-language goals now decide writes by default.
     parser.add_argument("--write-files", action="store_true", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
@@ -135,8 +133,7 @@ def main() -> None:
         if args.inspect:
             from src.runtime.store import RunStore
             store = RunStore.open(args.run_root, args.inspect)
-            events = [event for event in store.read_events() if (not args.agents or event["node"] in args.agents)
-                      and (not args.finding or args.finding in event.get("finding_ids", []))
+            events = [event for event in store.read_events() if (not args.finding or args.finding in event.get("finding_ids", []))
                       and (not args.node or event["node"] == args.node) and (not args.phase or event.get("stage") == args.phase)]
             diagnostics_path = store.path/"diagnostics.json"
             diagnostics = json.loads(diagnostics_path.read_text()) if diagnostics_path.exists() else []
@@ -145,7 +142,7 @@ def main() -> None:
         if args.finding or args.node or args.phase:
             raise ValueError("--finding, --node and --phase require --inspect")
         if args.resume:
-            if args.file or args.source_root or args.agents or args.scaffold:
+            if args.file or args.source_root or args.scaffold:
                 raise ValueError("Resume uses saved inputs, sources and agent selection")
             from src.workflow.service import resume_workflow
             result = resume_workflow(args.resume, run_root=args.run_root, allow_code_change=args.allow_code_change,
@@ -160,7 +157,7 @@ def main() -> None:
             from src.workflow.service import run_file_workflow
             result = run_file_workflow(
                 args.target, source_root=args.source_root, write_files=args.write_files,
-                mode=args.mode, active_agents=args.agents, task=args.task,
+                mode=args.mode, task=args.task,
                 max_fix_attempts=args.max_fix_attempts, scaffold=args.scaffold, run_root=args.run_root,
             )
             args.mode = result["mode"]
@@ -169,7 +166,7 @@ def main() -> None:
             from src.workflow.service import run_task_workflow
             result = run_task_workflow(
                 args.task, source_root=args.source_root or ".", run_root=args.run_root,
-                mode=args.mode, active_agents=args.agents, max_fix_attempts=args.max_fix_attempts,
+                mode=args.mode, max_fix_attempts=args.max_fix_attempts,
                 write_files=args.write_files,
             )
             args.mode = result["mode"]
@@ -183,9 +180,10 @@ def main() -> None:
                 return
             from src.workflow.service import run_workflow
             result = run_workflow(
-                diff, paths, mode=args.mode, active_agents=args.agents, task=args.task,
+                diff, paths, mode=args.mode, task=args.task,
                 max_fix_attempts=args.max_fix_attempts, scaffold=args.scaffold,
                 file_contents=_read_sources(paths, args.source_root),
+                source_root=args.source_root,
                 run_root=args.run_root,
                 write_root=args.source_root if args.write_files else None,
                 auto_write_root=args.source_root if args.task is not None and args.write_files is None else None,

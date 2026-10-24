@@ -141,6 +141,7 @@ run_workflow(SAMPLE_DIFF,mode='fix',model=KilledModel(),file_contents={'stats.py
                     "patch": failed["patch"].diff,
                     "validation": failed["validation"].summary,
                     "regression": failed["regression"].summary,
+                    "diagnosis": failed.get("failure_diagnosis", {}),
                 }])
                 self.assertEqual(planner_inputs, [(None, None, {}, "not_run", "not_run")])
                 self.assertEqual(resumed["status"], "proposed")

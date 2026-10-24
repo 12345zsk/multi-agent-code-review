@@ -22,6 +22,7 @@ ISSUE = Finding(
 
 def completed_review_handlers():
     return {
+        "review_planner": lambda state: {"active_agents": list(AGENT_IDS)},
         **{
             name: (lambda state, agent=name: {
                 "reports": {agent: AgentReport(agent, status="completed")}
@@ -42,16 +43,17 @@ def completed_fix_handlers():
         "test_generator": lambda state: {"test_patch": PatchArtifact("generated")},
         "validator": lambda state: {"validation": ValidationResult("passed", ("fake-check",))},
         "regression_reviewer": lambda state: {"regression": ValidationResult("passed")},
+        "failure_diagnoser": lambda state: {"failure_diagnosis": {"action": "retry"}},
     }
 
 
 class WorkflowTests(unittest.TestCase):
     def test_scaffold_is_explicitly_incomplete_and_does_not_fix(self):
         result = run_workflow(DIFF, mode="fix")
-        self.assertEqual(set(result["reports"]), set(AGENT_IDS))
+        self.assertEqual(result["reports"], {})
         self.assertEqual(result["status"], "incomplete")
         self.assertEqual(result["fix_attempts"], 0)
-        self.assertEqual(len(result["pending_steps"]), len(AGENT_IDS) + 1)
+        self.assertEqual(result["pending_steps"], ["review_planner"])
         self.assertNotIn("patch", result)
 
     def test_all_parallel_reports_join_once_before_adjudication(self):
@@ -67,10 +69,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(calls, [set(AGENT_IDS)])
         self.assertEqual(result["status"], "completed")
 
-    def test_subset_and_empty_selection_reach_reporter(self):
+    def test_planner_output_controls_dispatch_without_a_selection_argument(self):
         for selected in (["security"], []):
             with self.subTest(selected=selected):
-                result = run_workflow(DIFF, active_agents=selected)
+                handlers = completed_review_handlers()
+                handlers["review_planner"] = lambda state: {"active_agents": selected}
+                result = run_workflow(DIFF, handlers=handlers)
                 self.assertEqual(set(result["reports"]), set(selected))
                 self.assertIn("final_review", result)
 

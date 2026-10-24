@@ -28,6 +28,7 @@ def run_workflow(
     run_root: str | Path | None = None,
     write_root: str | Path | None = None,
     auto_write_root: str | Path | None = None,
+    source_root: str | Path | None = None,
     task: str | None = None,
     review_scope: Literal["diff", "file"] = "diff",
     target_file: str | None = None,
@@ -65,9 +66,13 @@ def run_workflow(
             raise ValueError("auto_write_root must be a directory")
         if write_root is not None and auto_write_root != write_root:
             raise ValueError("Automatic and explicit write boundaries must match")
-    selected = list(dict.fromkeys(AGENT_IDS if active_agents is None else active_agents))
-    if set(selected) - set(AGENT_IDS):
-        raise ValueError("active_agents contains unknown specialist IDs")
+    if active_agents is not None:
+        raise ValueError("Expert dispatch is dynamic; active_agents is no longer supported")
+    project_root = source_root or write_root or auto_write_root
+    if project_root is not None:
+        project_root = Path(project_root).resolve(strict=True)
+        if not project_root.is_dir() or any(boundary and Path(boundary) != project_root for boundary in (write_root, auto_write_root)):
+            raise ValueError("Source and write boundaries must match")
     sanitized_diff = redact(code_diff)
     changes = parse_diff(sanitized_diff)
     paths = [change.path for change in changes]
@@ -79,10 +84,11 @@ def run_workflow(
     validate_source_context(sources, changes)
     _validate_file_scope(sanitized_diff, paths, sources, review_scope)
     build_workflow_graph(handlers, model=model, scaffold=scaffold)
-    inputs = {"code_diff": sanitized_diff, "file_paths": paths, "file_contents": sources,
-              "mode": mode or "review", "active_agents": selected, "max_fix_attempts": max_fix_attempts, "scaffold": scaffold, "react": not scaffold,
+    inputs = {"workflow_version": 3, "code_diff": sanitized_diff, "file_paths": paths, "file_contents": sources,
+              "mode": mode or "review", "active_agents": [], "max_fix_attempts": max_fix_attempts, "scaffold": scaffold, "react": not scaffold,
               "user_task": redact(task) if task is not None else "", "requested_mode": mode,
-              "requested_agents": selected if active_agents is not None else None,
+              "source_root": str(project_root) if project_root else None,
+              "run_history_root": str(Path(run_root).resolve()) if run_root else None,
               "review_scope": review_scope, "target_file": target_file,
               "write_root": str(write_root) if write_root is not None else None,
               "auto_write_root": str(auto_write_root) if auto_write_root is not None else None}
@@ -93,8 +99,8 @@ def run_workflow(
 def _validate_file_scope(code_diff, paths, sources, review_scope):
     if review_scope == "file":
         from src.source_input import source_snapshot
-        if len(paths) != 1 or set(sources) != set(paths) or code_diff != source_snapshot(paths[0], sources[paths[0]]):
-            raise ValueError("File scope requires one complete, matching source snapshot")
+        if not paths or set(sources) != set(paths) or code_diff != "".join(source_snapshot(path, sources[path]) for path in paths):
+            raise ValueError("File scope requires complete, matching source snapshots")
 
 
 def run_file_workflow(
@@ -115,6 +121,7 @@ def run_file_workflow(
         file_contents={relative: source}, write_root=root if write_files else None,
         auto_write_root=root if task is not None and write_files is None else None,
         run_root=run_root, mode=mode, task=task, active_agents=active_agents,
+        source_root=root,
         max_fix_attempts=max_fix_attempts, model=model, scaffold=scaffold, handlers=handlers,
     )
 
@@ -124,7 +131,7 @@ def run_task_workflow(
     mode: Literal["review", "fix"] | None = None, active_agents: Sequence[str] | None = None,
     max_fix_attempts: int = 2, model=None, write_files: bool | None = None,
 ) -> WorkflowState:
-    """Resolve a file from natural language, then review and optionally repair it in place."""
+    """Resolve explicit files/directories, dynamically review and optionally repair targets in place."""
     from src.task_intent import MAX_TASK_CHARS
     if not isinstance(task, str) or not task.strip() or len(task) > MAX_TASK_CHARS:
         raise ValueError("task must contain 1 to 4000 characters")
@@ -134,16 +141,14 @@ def run_task_workflow(
         raise ValueError("max_fix_attempts must be a positive integer")
     if write_files is not None and type(write_files) is not bool:
         raise ValueError("write_files must be a boolean or None")
-    selected = list(dict.fromkeys(AGENT_IDS if active_agents is None else active_agents))
-    if set(selected) - set(AGENT_IDS):
-        raise ValueError("active_agents contains unknown specialist IDs")
+    if active_agents is not None:
+        raise ValueError("Expert dispatch is dynamic; active_agents is no longer supported")
     root = Path(source_root).resolve(strict=True)
     if not root.is_dir():
         raise ValueError("source_root must be a directory")
-    inputs = {"code_diff": "", "file_paths": [], "file_contents": {}, "mode": mode or "review",
-              "active_agents": selected, "max_fix_attempts": max_fix_attempts, "scaffold": False, "react": True,
+    inputs = {"workflow_version": 3, "code_diff": "", "file_paths": [], "file_contents": {}, "mode": mode or "review",
+              "active_agents": [], "max_fix_attempts": max_fix_attempts, "scaffold": False, "react": True,
               "user_task": redact(task), "requested_mode": mode,
-              "requested_agents": selected if active_agents is not None else None,
               "review_scope": "file", "target_file": None, "resolve_target": True,
               "source_root": str(root), "run_history_root": str(Path(run_root).resolve()) if run_root is not None else None,
               "write_root": str(root) if write_files else None,
@@ -166,6 +171,8 @@ def resume_workflow(run_id: str, *, run_root="output/runs", model=None, handlers
     if not inputs.get("resolve_target"):
         validate_source_context(inputs["file_contents"], parse_diff(inputs["code_diff"]))
         _validate_file_scope(inputs["code_diff"], inputs["file_paths"], inputs["file_contents"], inputs.get("review_scope", "diff"))
+    if inputs.get("workflow_version") != 3:
+        raise ValueError("Legacy dispatch/checkpoint layout is incompatible; start a new dynamically planned run")
     return _execute(inputs, store, model=model, handlers=handlers, resume=True,
                     allow_code_change=allow_code_change, additional_fix_attempts=additional_fix_attempts)
 
@@ -175,6 +182,8 @@ def _initial_state(inputs, run_id, run_dir=""):
         "run_id": run_id, "run_dir": run_dir, "input_hash": digest(inputs),
         "source_hashes": {path: hashlib.sha256(source.encode()).hexdigest() for path, source in inputs["file_contents"].items()},
         "reports": {}, "findings": [], "fix_attempts": 0, "pending_steps": [], "errors": [],
+        "review_plan": [], "observed_sources": {}, "review_round": 0, "review_disputes": [], "dispute_reviews": [],
+        "failure_diagnosis": {}, "failure_diagnoses": [],
         "write_result": {"status": "not_run", "files": []},
         "runtime_validation": ValidationResult(summary="No runtime code or tests are executed by this project.", scope="runtime"),
     }
@@ -233,11 +242,11 @@ def _execute(inputs, store, *, model=None, handlers=None, resume=False, allow_co
         if resume:
             tracer.record_interrupted_spans()
         graph = None
-        config = {"configurable": {"thread_id": run_id}, "recursion_limit": 32+8*state["max_fix_attempts"]}
+        config = {"configurable": {"thread_id": run_id}, "recursion_limit": 48+12*state["max_fix_attempts"]}
         connection = None
         initialized = False
         try:
-            if not inputs["scaffold"] and model is None and (state["active_agents"] or state.get("user_task")):
+            if not inputs["scaffold"] and model is None:
                 from src.llm import get_fast_llm
                 with tracer.node("model_initialization", state):
                     try:
@@ -286,7 +295,7 @@ def _execute(inputs, store, *, model=None, handlers=None, resume=False, allow_co
                         values = {key: state[key] for key in ("max_fix_attempts", "model_name")}
                         values.update(errors=Overwrite([]), pending_steps=Overwrite([]))
                         graph.update_state(config, values, as_node="adjudicator")
-                        config["recursion_limit"] = 32+8*state["max_fix_attempts"]
+                        config["recursion_limit"] = 48+12*state["max_fix_attempts"]
                         invoke_input = None
                     else:
                         raise ValueError("Run has no resumable pending task or repair; start a new run")
@@ -323,6 +332,9 @@ def _execute(inputs, store, *, model=None, handlers=None, resume=False, allow_co
         state["diagnostics"] = tracer.diagnostics()
         tracer.emit("run_finished", status=state.get("status", "failed"))
         state["trace_events"] = tracer.events
+        state["context_hashes"] = {path: hashlib.sha256(source.encode()).hexdigest()
+                                   for sources in state.get("observed_sources", {}).values()
+                                   for path, source in sources.items() if path not in state.get("file_contents", {})}
         state.update(reporter_node(state))
         if store:
             store.metadata["completion_id"] = tracer.session_id

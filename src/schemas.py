@@ -1,6 +1,6 @@
 """Strict JSON contracts for final review, adjudication and repair output."""
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from src.contracts import FindingCategory
@@ -51,6 +51,7 @@ class Decision(Reply):
 
 class AdjudicationReply(Reply):
     decisions: list[Decision] = Field(max_length=240)
+    disputes: list["DisputeRequest"] = Field(default_factory=list, max_length=3)
 
 
 class PlanReply(Reply):
@@ -79,3 +80,46 @@ class TestReply(Reply):
 class RegressionReply(Reply):
     status: Literal["passed", "failed", "not_run"]
     summary: str = Field(min_length=1, max_length=4000)
+
+
+class ReviewAssignment(Reply):
+    agent_id: Literal["bug_detector", "security", "code_quality", "test_coverage", "architecture", "performance", "dependency", "compatibility"]
+    reason: str = Field(min_length=1, max_length=1000)
+    questions: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(min_length=1, max_length=5)
+
+
+class ReviewPlanReply(Reply):
+    assignments: list[ReviewAssignment] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def unique_agents(self):
+        if len({item.agent_id for item in self.assignments}) != len(self.assignments):
+            raise ValueError("Duplicate specialist assignments")
+        return self
+
+
+class DisputeRequest(Reply):
+    agent_id: Literal["bug_detector", "security", "code_quality", "test_coverage", "architecture", "performance", "dependency", "compatibility"]
+    finding_ids: list[str] = Field(min_length=1, max_length=10)
+    question: str = Field(min_length=1, max_length=1000)
+
+
+class DisputeResolution(Reply):
+    finding_id: str
+    status: Literal["confirmed", "rejected", "candidate"]
+    reason: str = Field(min_length=1, max_length=2000)
+    evidence: str = Field(max_length=2000)
+
+
+class DisputeReply(Reply):
+    resolutions: list[DisputeResolution] = Field(min_length=1, max_length=10)
+
+
+class FailureDiagnosisReply(Reply):
+    category: Literal["context_missing", "code_patch", "test_patch", "regression", "unsupported"]
+    action: Literal["retry", "collect_context", "stop"]
+    summary: str = Field(min_length=1, max_length=2000)
+    instructions: str = Field(min_length=1, max_length=3000)
+
+
+AdjudicationReply.model_rebuild()

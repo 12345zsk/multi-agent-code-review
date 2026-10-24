@@ -1,6 +1,6 @@
 # 架构与实现说明
 
-项目现已统一到 `src/workflow/` 的 19 个节点，其中 `task_interpreter` 仅在提供自然语言任务时调用模型，`file_writer` 根据已准入任务的写入决策执行。`run_review()` 保留为返回 Markdown 的兼容接口；原有独立 Graph、文本状态和六个旧 Agent 已被统一实现替代。
+项目统一到 `src/workflow/` 的 21 个节点：17 个模型角色、4 个程序节点。`task_interpreter` 仅在有自然语言任务时执行模型解析，`review_planner` 始终动态分发；`file_writer` 根据已准入的写入决策执行。
 
 CLI 默认将报告和候选补丁保存到当前工作目录下的 `output/`，自动创建目录并显示保存路径。审查与修正报告分别为 `review.md`、`fix-review.md`，JSON 模式使用 `.json`；候选补丁为 `repair.diff`、`tests.diff`。显式路径参数优先，Graph 默认仍输出到终端。Python API 默认只返回数据，显式提供 run_root 或 write_root 可启用运行落盘及受限源码写入。
 
@@ -8,7 +8,7 @@ CLI 默认将报告和候选补丁保存到当前工作目录下的 `output/`，
 
 已实现：8 专家模型审查、严格结构化输出、证据和位置校验、问题仲裁与去重、修正计划、候选代码/测试补丁、内存静态验证、模型回归审查、有限重试、Markdown/JSON 输出和 CLI。
 
-内置能力：正常审查与修正中的专家默认使用 `model → read_source → model` ReAct 子图，无需启用参数，最终仍输出严格结构化 Findings。唯一工具只读本次输入的脱敏源码快照，详细限制见 README。离线 scaffold 不调用模型。
+内置能力：动态规划、专家、争议复核和失败诊断使用 `model → project tools → model` ReAct 子图。工具可列目录、搜索代码、读取授权项目文件、静态提取 Python 导入和定义；快照、预算、脱敏与路径校验由 `src/project_tools.py` 控制。
 
 自动写入：自然语言要求修正本地文件时，任务解析节点结合源码边界决定有效 `write_root`，无需 CLI 写入开关；只审查、只给建议或只生成补丁时保持为空。diff 输入须显式提供 `--source-root`，`--target` 默认使用当前目录作为边界。`auto_write_root` 仅表示可用边界，不能单独触发写入；还需 fix 目标、持久化备份、确认问题、静态及模型回归通过。`file_writer` 调用受限 `write_file` 工具，输入及候选版本校验、原文件备份、回执和可恢复写入由 `src/file_tools.py` 负责。
 
@@ -16,86 +16,89 @@ CLI 默认将报告和候选补丁保存到当前工作目录下的 `output/`，
 
 输入有两种范围：`--file` / Git 输入使用 `review_scope=diff`，仅审查变更引入的问题；`--target` / `run_file_workflow()` 使用 `review_scope=file`，读取明确指定的现有源码文件并审查其已有缺陷。后者由 `src/source_input.py` 编码完整、仅含上下文的快照，不要求手工 diff，也不虚构文件新增。源码允许包含语法错误；候选修正必须通过语法验证后才可写入。绝对目标路径及相对文件名作为同一输入提供给任务解析器，避免范围不一致。
 
-纯自然语言入口 `code-review "检查 examples/review_target.py，有错误就修正"` / `run_task_workflow()` 同样使用 file 范围，不要求指定 target。`task_interpreter` 使用严格的 `FileTaskIntent` 同时提取目标引用及审查/修正意图；引用必须是原任务中的完整字面路径或文件名。程序验证路径边界，仅允许明确路径或受限查找得到的唯一同名文件；不会按模型推荐替换文件，也不会回退到其他 Git 输入。当前一次只支持一个源码目标。修正仍通过原来的验证和写入链直接修改原文件。
+纯自然语言入口支持多个明确文件或目录引用。`FileTaskIntent.targets` 保存逐字引用，兼容单个历史 `target` 字段。程序限定项目边界并读取完整目标快照；目录最多展开 20 个源码文件，合并快照仍受输入预算限制。工具发现的相关文件只作为上下文，不自动扩展发现和写入范围。
 
 ## 实际 Graph
 
-以下按当前生产代码绘制。外层包含 **19 个节点：14 个可调用模型的角色、5 个程序节点**，开始/结束、分组及边标签不计入节点数。蓝色为模型角色，绿色为程序节点。任务解析仅在提供自然语言目标时调用模型；其余正常审查专家默认内置 ReAct。
+以下为当前生产图直接导出的 21 个节点。模型角色包括任务解析、动态规划、8 类专家、仲裁、争议复核、修正规划、代码生成、测试生成、模型回归和失败诊断；上下文收集、静态验证、写入、报告为程序节点。
 
 ```mermaid
-flowchart TB
-    START(["输入自然语言任务、diff 或指定源码文件<br/>入口校验请求、脱敏与运行初始化"])
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	task_interpreter(task_interpreter)
+	context_collector(context_collector)
+	review_planner(review_planner)
+	bug_detector(bug_detector)
+	security(security)
+	code_quality(code_quality)
+	test_coverage(test_coverage)
+	architecture(architecture)
+	performance(performance)
+	dependency(dependency)
+	compatibility(compatibility)
+	adjudicator(adjudicator)
+	dispute_reviewer(dispute_reviewer)
+	fix_planner(fix_planner)
+	patch_generator(patch_generator)
+	test_generator(test_generator)
+	validator(validator)
+	regression_reviewer(regression_reviewer)
+	failure_diagnoser(failure_diagnoser)
+	file_writer(file_writer)
+	reporter(reporter)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> task_interpreter;
+	adjudicator -.-> dispute_reviewer;
+	adjudicator -.-> fix_planner;
+	adjudicator -.-> reporter;
+	architecture --> adjudicator;
+	bug_detector --> adjudicator;
+	code_quality --> adjudicator;
+	compatibility --> adjudicator;
+	context_collector --> review_planner;
+	dependency --> adjudicator;
+	dispute_reviewer --> adjudicator;
+	failure_diagnoser -.-> fix_planner;
+	failure_diagnoser -.-> reporter;
+	file_writer --> reporter;
+	fix_planner -.-> patch_generator;
+	fix_planner -.-> reporter;
+	patch_generator -.-> reporter;
+	patch_generator -.-> test_generator;
+	performance --> adjudicator;
+	regression_reviewer -.-> failure_diagnoser;
+	regression_reviewer -.-> file_writer;
+	regression_reviewer -.-> reporter;
+	review_planner -.-> architecture;
+	review_planner -.-> bug_detector;
+	review_planner -.-> code_quality;
+	review_planner -.-> compatibility;
+	review_planner -.-> dependency;
+	review_planner -.-> performance;
+	review_planner -.-> reporter;
+	review_planner -.-> security;
+	review_planner -.-> test_coverage;
+	security --> adjudicator;
+	task_interpreter -.-> context_collector;
+	task_interpreter -.-> reporter;
+	test_coverage --> adjudicator;
+	test_generator --> validator;
+	validator -.-> failure_diagnoser;
+	validator -.-> regression_reviewer;
+	validator -.-> reporter;
+	reporter --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
 
-    subgraph admission["一、任务准入与专家分发"]
-        task_interpreter["任务边界、目标定位与写入判断<br/>task_interpreter"]
-        context_collector["整理差异、文件与定位上下文<br/>context_collector"]
-        review_planner["按用户范围分发；默认全部专家<br/>review_planner"]
-    end
-
-    subgraph specialists["二、选中专家并行审查：各自运行 ReAct，输出经证据校验的 Findings"]
-        bug_detector["逻辑与边界<br/>bug_detector"]
-        security["安全与信任边界<br/>security"]
-        code_quality["质量与可维护性<br/>code_quality"]
-        test_coverage["测试缺口<br/>test_coverage"]
-        architecture["模块与依赖方向<br/>architecture"]
-        performance["性能与资源<br/>performance"]
-        dependency["依赖与版本风险<br/>dependency"]
-        compatibility["接口与兼容性<br/>compatibility"]
-    end
-
-    adjudicator["汇合、去重、确认或拒绝问题<br/>adjudicator"]
-
-    subgraph repair["三、仅 fix 模式进入修正闭环"]
-        fix_planner["修正规划：保留反馈并开启本次尝试<br/>fix_planner"]
-        patch_generator["生成完整候选代码补丁<br/>patch_generator"]
-        test_generator["生成候选回归测试或说明无需生成<br/>test_generator"]
-        validator["内存静态验证：补丁、范围、语法<br/>validator"]
-        regression_reviewer["模型复核缺陷修复与回归风险<br/>regression_reviewer"]
-        file_writer["复查、备份、调用受限 write_file<br/>file_writer"]
-    end
-
-    reporter["汇总任务结果、问题、产物与诊断<br/>reporter"]
-    FINISH(["返回结果；启用持久化时保存运行记录<br/>CLI 发布报告及满足条件的有效候选"])
-
-    START --> task_interpreter
-    task_interpreter -->|"通过或未提供自然语言目标"| context_collector
-    task_interpreter -->|"越界、需澄清或已记录错误"| reporter
-    context_collector --> review_planner
-    review_planner --> bug_detector & security & code_quality & test_coverage
-    review_planner --> architecture & performance & dependency & compatibility
-    review_planner -->|"空专家列表；最终标记未完成"| adjudicator
-    bug_detector & security & code_quality & test_coverage --> adjudicator
-    architecture & performance & dependency & compatibility --> adjudicator
-
-    adjudicator -->|"review、无确认可修正问题或审查未完成"| reporter
-    adjudicator -->|"fix；审查完整且无阻塞<br/>存在 confirmed 且 fixable 的问题"| fix_planner
-    fix_planner -->|"计划 ready 且无阻塞"| patch_generator
-    fix_planner -->|"计划未就绪或已记录错误"| reporter
-    patch_generator -->|"已生成非空补丁且无阻塞"| test_generator
-    patch_generator -->|"补丁未就绪或已记录错误"| reporter
-    test_generator --> validator
-    validator -->|"静态通过；或缺少完整源码并有说明"| regression_reviewer
-    validator -->|"静态失败且尚有尝试次数"| fix_planner
-    validator -->|"错误、其他结果或达到上限"| reporter
-    regression_reviewer -->|"模型复核失败且尚有尝试次数"| fix_planner
-    regression_reviewer -->|"模型与静态均通过<br/>且任务决定写回"| file_writer
-    regression_reviewer -->|"任务只需候选、证据不足、错误或达到上限"| reporter
-    file_writer --> reporter
-    reporter --> FINISH
-
-    classDef modelAgent fill:#eef2ff,stroke:#5262c6,color:#172554
-    classDef program fill:#ecfdf5,stroke:#2e8b70,color:#14532d
-    classDef boundary fill:#fff7ed,stroke:#b77933,color:#78350f
-    class task_interpreter,bug_detector,security,code_quality,test_coverage,architecture,performance,dependency,compatibility,adjudicator,fix_planner,patch_generator,test_generator,regression_reviewer modelAgent
-    class context_collector,review_planner,validator,file_writer,reporter program
-    class START,FINISH boundary
 ```
 
-选中的专家在同一并行阶段汇合，未选中的专家不执行；不是八个专家依次串行。`review_planner` 当前只保留用户指定范围，不会根据代码风险自主挑选专家。默认修正上限为 **2 次总尝试**，包含首次；回到 `fix_planner` 时保留上轮失败反馈并清空旧候选。
-
-`reporter` 是程序节点，不是模型 Agent。静态检查、模型回归和真实运行测试是不同范围：当前项目**不执行目标代码或测试**。只有 `proposed`、静态通过且模型回归通过的结果，才发布为有效候选；缺少源码时即使得到修正建议，也保留验证限制，不能进入写入节点。
-
-图中的“已记录错误”是图内路由条件；在 CLI 默认启用的持久化模式中，节点异常会中断图，由外层服务捕获并调用报告函数，详见下方恢复图。
+专家按动态计划并行执行，随后仲裁。争议和不确定项最多进入一轮定向复核，再由仲裁器结合补证决定；预算耗尽后仍有争议的问题保留为 candidate，不进入自动修正。静态或模型回归失败先进入 failure_diagnoser，由诊断决定补证后重试、直接重试或停止；默认总修正次数仍为 2。
 
 ### 每个审查专家内部的 ReAct 子图
 
@@ -105,20 +108,22 @@ flowchart TB
 flowchart LR
     INPUT(["专家职责、已准入目标<br/>diff 或完整文件快照、目标行号、可读源码目录"])
     MODEL["模型分析并选择下一步<br/>model"]
-    TOOLS["Action：调用 read_source<br/>仅读取输入的脱敏源码快照<br/>Observation：追加 ToolMessage<br/>tools"]
+    TOOLS["Action：调用项目工具<br/>列目录、搜索、读取或静态分析<br/>Observation：追加 ToolMessage<br/>tools"]
     FINDINGS(["最终 JSON 与 schema 校验通过<br/>专家继续校验证据、定位与问题 ID<br/>返回结构化 Findings"])
-    ERROR(["超出预算、非法工具、模型错误<br/>或最终格式重答仍失败<br/>专家失败，进入诊断与恢复流程"])
+    ERROR(["非法工具、模型错误、拒绝最终输出<br/>或最终格式重答仍失败<br/>专家失败，进入诊断与恢复流程"])
 
     INPUT --> MODEL
-    MODEL -->|"需要补充上下文；每轮一个请求"| TOOLS
-    TOOLS -->|"读取结果或可纠正的参数错误观察"| MODEL
+    MODEL -->|"需要补充上下文；整批校验并预留预算"| TOOLS
+    TOOLS -->|"批次仍有待执行调用；逐个保存检查点"| TOOLS
+    TOOLS -->|"批次完成；全部结果或参数错误观察"| MODEL
     MODEL -->|"证据足够，可直接结束"| FINDINGS
     MODEL -->|"首次 JSON/schema 格式错误；最多重答一次"| MODEL
+    MODEL -->|"工具预算耗尽或批次超额；关闭工具并要求最终 JSON"| MODEL
     MODEL -->|"协议、预算或请求失败"| ERROR
     TOOLS -->|"不可恢复的工具执行错误"| ERROR
 ```
 
-ReAct 对新运行默认生效，不需要开关；模型不必为调用工具而调用。每个专家最多 3 次工具调用、5 次模型请求，客户端网络重试另计。工具读取不超过 200 行、源码文本不超过 16,000 字符。参数错误可作为观察交回模型纠正；越界工具、并行工具请求或超限会失败。`write_file` 由外层 `file_writer` 控制，不开放给这些专家自主写入。
+ReAct 对新运行默认生效，不需要开关；模型不必为调用工具而调用。每个 ReAct 子流程最多 8 次工具调用、10 次模型请求，客户端网络重试另计。每轮告知模型剩余工具和请求预算，最后两次模型请求预留给最终 JSON 与一次格式重答。同一响应中的多个合法工具调用先整批校验，按实际调用数预留预算，再逐个执行；每次工具完成后保存检查点，全部观察返回后才再次请求模型。批次超出剩余预算时整批不执行，为每个调用 ID 返回预算错误观察，然后关闭工具要求最终 JSON；工具预算用完时也直接进入无工具收尾，不因超限请求立即中断审查。收尾仅使用已收集证据，不编造缺陷或完整覆盖；报告标记上下文受限，没有确认的中高风险问题时不直接给 APPROVE。模型拒绝收尾、非法工具、重复调用 ID、最终格式重答失败或模型请求总预算耗尽仍明确失败。源码读取不超过 200 行、16,000 字符；累计上下文最多 120,000 字符。工具参数错误作为观察返回。write_file 仍由验证后的程序节点控制。
 
 ### 运行追踪、故障与恢复
 
@@ -150,11 +155,11 @@ flowchart TB
 
 源码依据为 `src/workflow/graph.py`、`src/react.py` 和 `src/workflow/service.py`。如需无说明、由当前 LangGraph 直接导出的原始拓扑，可运行 `code-review --graph --output output/workflow.mmd`。
 
-选择全部专家是默认行为。调用方可以通过 `active_agents` / `--agents` 指定子集；提供 `task` / `--task` 时，入口模型也能解析用户明确限定的专家范围。没有基于风险自动选择专家的路由，任务解析本身会产生模型调用成本。空专家列表可到达报告，但不会给出完成审查的结论。
+`review_planner` 根据任务、目标代码、项目目录和按需工具观察输出 `ReviewPlanReply.assignments`；每项包含唯一合法 agent_id、选择理由和具体 questions。计划为空、重复角色或非法角色均报错，不回退到全量分发。用户关注领域作为指导，CLI 不再接受 --agents，API 不再执行手动 active_agents。
 
 `src/task_intent.py` 实现任务准入。严格 schema 约束 accepted / unsupported / needs_clarification，拒绝结果不能携带一个替代执行任务。越界与混合越界请求整体停止；意图不清、模式或专家冲突、写入要求与显式权限冲突时停止并提示。通过的规范化指导传给全部相关模型角色，但不能覆盖问题证据、补丁范围和工具权限。原始任务先脱敏，只有规范化目标进入公共报告。任务节点和决策进入检查点，恢复复用已完成解析；拒绝或需澄清的运行必须修改请求后新建，不能直接 resume。
 
-每个专家在外层图中执行一次；所有选中专家在同一并行阶段完成后，仲裁器汇合结果一次。并行报告按专家 ID 合并，异常转换成节点名和异常类型，不输出原始 provider 错误。
+首次选中的专家在一个并行阶段完成并汇合。仲裁后的 dispute_reviewer 仅咨询被指派的专家，返回既有 finding ID 的结构化补证，再触发一次仲裁；不会让全部专家循环讨论。
 
 ## 8 类专家
 
@@ -173,17 +178,21 @@ flowchart TB
 
 证据校验只能证明引用存在，不能证明模型推断正确。仲裁器继续结合 diff 和源文件确认、拒绝或保留不确定项。
 
+ReAct 将工具状态、截断标记、不可读路径和匹配数量保存到检查点及 `AgentReport.tool_observations`，传给仲裁与定向复核；复核的新观察也随结果返回再次仲裁。此摘要不含搜索词、原始参数或源码文本。Markdown 报告显示专家检索的截断与不可读数量。零匹配、文件目录或有限静态搜索不能证明测试不存在；当前没有权威覆盖率输入，因此 `tests.missing_coverage` 只能保留为 `candidate` 或被拒绝，不能自动修正，模型在复核后声称已确认也不能越过该约束。其他有源码支持的功能缺陷仍可独立进入修正。
+
+专家、仲裁和争议复核同时要求按输入条件追踪调用顺序及最先发生的异常。例如，导出函数先调用含除法的平均值函数，再访问缺失字典键时，空输入可能先触发 `ZeroDivisionError`，非空有效输入才到达 `KeyError`；描述必须区分这些情况，不能概括为所有输入触发同一异常。这类语义判断仍需真实模型复测或人工确认。
+
 专家必须遵守代码声明的类型和契约，不把契约外的错误类型输入直接判为缺陷，也不凭有限输入断言整个仓库没有测试或函数是热路径。覆盖摘要由程序生成候选数量与审查范围，不直接展示未校验的模型自由文本。
 
 ## 结构化模型交互
 
 `src/model_agent.py` 中的 `invoke_json()` 发送任务角色、schema 和脱敏后的 JSON 上下文。`src/schemas.py` 使用 Pydantic 严格校验，禁止未知字段和类型转换。支持纯 JSON、完整 JSON 代码块和文本内容块。
 
-JSON 或 schema 错误允许一次重答；不会回显原始错误响应。专家的内置 ReAct 每轮仅接受一个 `read_source` 请求，工具结果通过原生 `ToolMessage` 返回模型；仲裁和修正等直接结构化输出节点仍拒绝工具调用。无效工具调用直接拒绝。网络层由模型客户端设置 60 秒超时及最多 2 次请求重试；格式修复次数与网络重试次数是两个独立上限。
+JSON 或 schema 错误允许一次重答，不回显错误响应。ReAct 接受预算内的注册工具调用批次，按请求顺序串行执行。动态规划、专家、争议复核和失败诊断可用工具；仲裁、补丁生成和模型回归仍直接输出严格 JSON。工具次数与客户端网络重试独立计数。任务解析不接收专家目录；通过准入后，guidance 使用脱敏后的用户原始指令，不采用模型自行扩展的审查清单，专家仍由规划器根据证据动态选择。
 
 业务节点统一使用带 schema 的 `invoke_json()`；ReAct 复用相同的最终 JSON 解析和校验契约。原有生产流程未使用的 make_model_handler 适配器已移除。
 
-`src/react.py` 提供内置的最小 ReAct 子图，模型调用和工具执行为独立节点，继承外层检查点。每位专家拥有独立的消息历史和调用预算；完成的读取后若模型请求失败，恢复复用已保存的工具观察。事件记录步骤、工具调用 ID、参数与结果摘要哈希、源码哈希和耗时，最终 Findings 继续经过既有证据校验及仲裁。历史运行恢复时保留保存的执行方式，内部兼容分支不作为新运行的用户开关。
+`src/react.py` 将模型和工具执行分为两个实际子节点，继承外层检查点。观察过的完整脱敏源码保存在私有 observed_sources 通道和 context_snapshots 中；公开 JSON 只导出 context_hashes。上下文首次读取后固定版本，恢复复用快照；未读取文件若已变化则拒绝读取，写回前若已使用的上下文变化则报 CONTEXT_VERSION_CHANGED。版本 3 之前的工作流布局不支持直接恢复，应新建运行。
 
 ## 仲裁与修正
 
@@ -239,7 +248,8 @@ src/
   config.py                  默认模型与输入大小限制
   llm.py                     延迟读取环境配置并创建 DeepSeek 客户端
   model_agent.py             JSON/schema 模型交互及低层适配器
-  react.py                   内置 ReAct 子图与只读 read_source 工具
+  react.py                   多工具 ReAct 子图、预算与持久化观察
+  project_tools.py           受限目录、代码搜索、动态源码快照与 Python 结构分析
   task_intent.py             自然语言意图及目标 schema、文件定位与写入决策
   source_input.py            完整引用校验、受限同名查找、安全读取与源码快照
   file_tools.py              受限 write_file、版本检查、备份与写入回执
@@ -255,9 +265,9 @@ src/
     service.py               公共结构化 API、输入校验和初始状态
     nodes.py                 上下文、规划与 Markdown 报告
     scaffold.py              显式离线占位模式，与正常业务分离
-  review/nodes.py             专家、证据校验与仲裁
+  review/nodes.py             专家、证据校验、仲裁与定向争议复核
   review/evidence.py          连续证据匹配、行号定位与分级证据校验
-  repair/nodes.py             计划、补丁、测试、内存验证与模型回归
+  repair/nodes.py             计划、补丁、测试、静态验证、模型回归与失败诊断
   repair/patches.py           模型补丁行数校正、精确定位与规范输出
 examples/
   repair_demo.py             使用模拟模型跑完整生产流程
@@ -265,8 +275,9 @@ examples/
   review_target.diff         与正式样例一致的新增文件输入 diff
   review_target.md           缺陷清单、审查与候选修正命令
  tests/                      离线流程、解析、CLI、脱敏和异常测试
+ generated_tests/            智能体为被审查代码生成的回归测试，与框架测试分开
  evals/                      结构化检出、定位、人工修正验收与微平均评估
- .github/workflows/          离线 CI 和按需 PR AI 审查
+ .github/workflows/          离线 CI
 ```
 
 `__init__.py` 用于定义包或导出接口。CLI 默认使用本地 SQLite 检查点，并在独立运行目录保存归属清单、事件和诊断；库 API 可用 `run_root=` 启用持久化。完整源码和输入 diff 不会出现在 JSON 报告导出中，但私有恢复输入和检查点会保存已脱敏代码，候选补丁本身也包含代码，需要按源码管理。运行、恢复及评估协议见 `docs/RUNS_AND_EVALUATION.md`。

@@ -48,7 +48,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 0, error)
             self.assertEqual(json.loads(report.read_text())["status"], "proposed")
             self.assertIn("+    if not values:", patch_file.read_text())
-            self.assertIn("tests/test_stats.py", test_file.read_text())
+            self.assertIn("generated_tests/test_stats.py", test_file.read_text())
             self.assertEqual((root / "stats.py").read_text(), CURRENT)
 
     def test_review_defaults_to_output_under_current_directory(self):
@@ -75,7 +75,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 0, error)
             self.assertEqual(json.loads((root / "output" / "fix-review.json").read_text())["status"], "proposed")
             self.assertIn("+    if not values:", (root / "output" / "repair.diff").read_text())
-            self.assertIn("tests/test_stats.py", (root / "output" / "tests.diff").read_text())
+            self.assertIn("generated_tests/test_stats.py", (root / "output" / "tests.diff").read_text())
             self.assertEqual((root / "stats.py").read_text(), CURRENT)
 
     def test_root_commit_and_empty_staged_changes(self):

@@ -186,7 +186,13 @@ class RunStore:
                 relative = str(path.relative_to(self.path))
                 artifacts[relative] = {"path": relative, "classification": "source_backup" if path.suffix == ".bak" else "write_receipt",
                                        "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        for path in sorted((self.path/"context_snapshots").glob("*.json")):
+            relative = str(path.relative_to(self.path))
+            artifacts[relative] = {"path": relative, "classification": "private_context_snapshot",
+                                   "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
         self.metadata.update(status=state["status"], mode=state["mode"], target_file=state.get("target_file") or self.metadata.get("target_file"),
+                             target_files=state.get("target_files", []), active_agents=state.get("active_agents", []),
+                             workflow_version=state.get("workflow_version"), context_hashes=state.get("context_hashes", {}),
                              finished_at=timestamp(), model_name=state.get("model_name", "unknown"),
                              artifacts=artifacts, candidate_valid=bool(eligible),
                              write_status=state.get("write_result", {}).get("status", "not_run"),
@@ -208,6 +214,8 @@ def publish_run(store, *, report_path, patch_path, test_path, output_root="outpu
         current = json.loads((store.path/"manifest.json").read_text())
         if current.get("target_file") and Path(current["target_file"]).resolve() in targets:
             raise ValueError("Output paths must not overwrite the reviewed source file; inspect run " + store.run_id)
+        if {Path(path).resolve() for path in current.get("target_files", [])} & set(targets):
+            raise ValueError("Output paths must not overwrite reviewed source files; inspect run " + store.run_id)
         if current.get("write_root"):
             protected = {(Path(current["write_root"])/path).resolve() for path in current.get("write_paths", [])}
             if set(targets) & protected:

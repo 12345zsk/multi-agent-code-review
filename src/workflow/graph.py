@@ -8,7 +8,7 @@ from langgraph.graph import END, START, StateGraph
 
 from src.contracts import AgentReport, FixPlan, NodeHandler, ValidationResult, WorkflowState
 from src.repair import nodes as repair
-from src.review.nodes import adjudicator_node, make_specialist_node
+from src.review.nodes import adjudicator_node, dispute_reviewer_node, make_specialist_node
 from src.task_intent import task_interpreter_node
 from src.workflow.nodes import (
     context_collector_node,
@@ -29,13 +29,15 @@ def _safe_node(name: str, handler: NodeHandler, tracer=None) -> NodeHandler:
             with tracer.node(name, state) if tracer else nullcontext() as span:
                 update = handler(state)
                 if name in AGENT_IDS:
-                    if set(update) - {"reports", "pending_steps", "errors"}:
+                    if set(update) - {"reports", "observed_sources", "pending_steps", "errors"}:
                         raise ValueError("Specialists must only update reduced fields")
                     report = update.get("reports", {}).get(name)
                     if not isinstance(report, AgentReport) or report.agent_id != name:
                         raise ValueError("Specialist must return its own AgentReport")
                     if set(update["reports"]) != {name}:
                         raise ValueError("Specialists cannot overwrite another report")
+                    if set(update.get("observed_sources", {})) - {name}:
+                        raise ValueError("Specialists cannot overwrite another source observation")
                 if span:
                     found = [f.id for f in update.get("findings", [])]
                     found.extend(f.id for report in update.get("reports", {}).values() for f in report.findings)
@@ -64,8 +66,10 @@ def _safe_node(name: str, handler: NodeHandler, tracer=None) -> NodeHandler:
 
 
 def _route_reviews(state: WorkflowState) -> list[str]:
+    if _blocked(state):
+        return ["reporter"]
     selected = [agent for agent in state["active_agents"] if agent in AGENT_IDS]
-    return selected or ["adjudicator"]
+    return selected or ["reporter"]
 
 
 def _route_task(state: WorkflowState) -> str:
@@ -75,6 +79,8 @@ def _route_task(state: WorkflowState) -> str:
 
 
 def _route_findings(state: WorkflowState) -> str:
+    if state.get("review_disputes") and state.get("review_round", 0) < 1 and not _blocked(state):
+        return "dispute_reviewer"
     complete = all(
         state.get("reports", {}).get(agent, AgentReport(agent)).status == "completed"
         for agent in state["active_agents"]
@@ -105,18 +111,25 @@ def _route_validation(state: WorkflowState) -> str:
     result = state.get("validation", ValidationResult())
     if result.status == "passed" or (result.status == "not_run" and result.summary):
         return "regression_reviewer"
-    if result.status == "failed" and state["fix_attempts"] < state["max_fix_attempts"]:
-        return "fix_planner"
+    if result.status == "failed":
+        return "failure_diagnoser"
     return "reporter"
 
 
 def _route_regression(state: WorkflowState) -> str:
     result = state.get("regression", ValidationResult())
-    if not _blocked(state) and result.status == "failed" and state["fix_attempts"] < state["max_fix_attempts"]:
-        return "fix_planner"
+    if not _blocked(state) and result.status == "failed":
+        return "failure_diagnoser"
     if (not _blocked(state) and result.status == "passed" and state.get("write_root")
             and state.get("validation", ValidationResult()).status == "passed"):
         return "file_writer"
+    return "reporter"
+
+
+def _route_diagnosis(state: WorkflowState) -> str:
+    if (not _blocked(state) and state.get("failure_diagnosis", {}).get("action") in {"retry", "collect_context"}
+            and state["fix_attempts"] < state["max_fix_attempts"]):
+        return "fix_planner"
     return "reporter"
 
 
@@ -130,14 +143,16 @@ def build_workflow_graph(handlers: Mapping[str, NodeHandler] | None = None, *, m
     nodes = {
         "task_interpreter": partial(task_interpreter_node, model=model),
         "context_collector": context_collector_node,
-        "review_planner": review_planner_node,
+        "review_planner": partial(review_planner_node, model=model),
         **{spec.id: make_specialist_node(spec, model, react=react) for spec in REVIEW_AGENTS},
         "adjudicator": partial(adjudicator_node, model=model),
+        "dispute_reviewer": partial(dispute_reviewer_node, model=model),
         "fix_planner": partial(repair.fix_planner_node, model=model),
         "patch_generator": partial(repair.patch_generator_node, model=model),
         "test_generator": partial(repair.test_generator_node, model=model),
         "validator": repair.validator_node,
         "regression_reviewer": partial(repair.regression_reviewer_node, model=model),
+        "failure_diagnoser": partial(repair.failure_diagnoser_node, model=model),
         "file_writer": repair.file_writer_node,
         "reporter": reporter_node,
     }
@@ -159,6 +174,7 @@ def build_workflow_graph(handlers: Mapping[str, NodeHandler] | None = None, *, m
                 "patch": state["patch"].diff if state.get("patch") else "",
                 "validation": state.get("validation", ValidationResult()).summary,
                 "regression": state.get("regression", ValidationResult()).summary,
+                "diagnosis": state.get("failure_diagnosis", {}),
             },
             "fix_attempts": state["fix_attempts"] + 1,
             "fix_plan": FixPlan(),
@@ -182,15 +198,17 @@ def build_workflow_graph(handlers: Mapping[str, NodeHandler] | None = None, *, m
     graph.add_edge(START, "task_interpreter")
     graph.add_conditional_edges("task_interpreter", _route_task, ["context_collector", "reporter"])
     graph.add_edge("context_collector", "review_planner")
-    graph.add_conditional_edges("review_planner", _route_reviews, [*AGENT_IDS, "adjudicator"])
+    graph.add_conditional_edges("review_planner", _route_reviews, [*AGENT_IDS, "reporter"])
     for agent in AGENT_IDS:
         graph.add_edge(agent, "adjudicator")
-    graph.add_conditional_edges("adjudicator", _route_findings, ["fix_planner", "reporter"])
+    graph.add_conditional_edges("adjudicator", _route_findings, ["dispute_reviewer", "fix_planner", "reporter"])
+    graph.add_edge("dispute_reviewer", "adjudicator")
     graph.add_conditional_edges("fix_planner", _route_plan, ["patch_generator", "reporter"])
     graph.add_conditional_edges("patch_generator", _route_patch, ["test_generator", "reporter"])
     graph.add_edge("test_generator", "validator")
-    graph.add_conditional_edges("validator", _route_validation, ["regression_reviewer", "fix_planner", "reporter"])
-    graph.add_conditional_edges("regression_reviewer", _route_regression, ["fix_planner", "file_writer", "reporter"])
+    graph.add_conditional_edges("validator", _route_validation, ["regression_reviewer", "failure_diagnoser", "reporter"])
+    graph.add_conditional_edges("regression_reviewer", _route_regression, ["failure_diagnoser", "file_writer", "reporter"])
+    graph.add_conditional_edges("failure_diagnoser", _route_diagnosis, ["fix_planner", "reporter"])
     graph.add_edge("file_writer", "reporter")
     graph.add_edge("reporter", END)
     return graph.compile(checkpointer=checkpointer)

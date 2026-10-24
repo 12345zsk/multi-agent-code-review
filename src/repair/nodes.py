@@ -7,16 +7,18 @@ from pathlib import PurePosixPath
 from src.contracts import FixPlan, PatchArtifact, ValidationResult, WorkflowState
 from src.diff import DiffError, apply_patch, parse_diff
 from src.model_agent import ModelOutputError, invoke_json
-from src.repair.patches import canonicalize_patch
-from src.runtime.tracing import trace_stage
-from src.schemas import PatchReply, PlanReply, RegressionReply, TestReply
+from src.repair.patches import canonicalize_patch, scope_new_tests
+from src.runtime.tracing import digest, trace_stage
+from src.schemas import FailureDiagnosisReply, PatchReply, PlanReply, RegressionReply, TestReply
+from src.project_tools import available_sources, react_options
 from src.task_intent import task_context
 
 
 def _repair_input(state: WorkflowState) -> dict:
     return {
         **task_context(state),
-        "diff": state["code_diff"], "sources": state.get("file_contents", {}),
+        "file_paths": state["file_paths"],
+        "diff": state["code_diff"], "sources": available_sources(state),
         "findings": [asdict(f) for f in state["findings"] if f.status == "confirmed" and f.fixable],
         "previous_attempt": state.get("previous_attempt", {}),
     }
@@ -58,11 +60,16 @@ def test_generator_node(state: WorkflowState, model) -> dict:
         model, "test_generator",
         "Generate focused regression tests for the candidate code patch. Return a valid unified diff. "
         "Only modify test files; new test files use --- /dev/null. For Python use standard-library unittest only, never pytest or new third-party test dependencies. "
-        "Use test_*.py filenames and define unittest.TestCase subclasses with test_ methods, runnable with python -m unittest discover -s tests -v. "
+        "Place all newly generated tests directly in generated_tests/, separate from framework tests/. "
+        "Existing test files may be edited only if explicitly included in file_paths; observed context is read-only. "
+        "Use test_*.py filenames and define unittest.TestCase subclasses with test_ methods, runnable with python -m unittest discover -s generated_tests -v. "
+        "When new_test_suffix is supplied, append it to each new Python test filename stem before .py. "
+        "Keep new test modules self-contained; do not import other newly generated test modules. "
         "Tests must assert the desired contract, including the reported failure and a normal case. "
         "If meaningful tests cannot be generated from supplied context, return not_needed with an explicit limitation and empty diff. "
         "Never claim tests were executed or passed.",
-        {**_repair_input(state), "patch": asdict(state["patch"])}, TestReply,
+        {**_repair_input(state), "patch": asdict(state["patch"]),
+         "new_test_suffix": "__run_" + digest(state["run_id"])[:12] if state.get("write_root") and state.get("run_id") else None}, TestReply,
     )
     return {"test_patch": PatchArtifact(reply.status, reply.diff, state["fix_plan"].finding_ids, reply.summary)}
 
@@ -70,7 +77,7 @@ def test_generator_node(state: WorkflowState, model) -> dict:
 def _is_test_path(path: str) -> bool:
     file = PurePosixPath(path)
     return (
-        any(part in {"test", "tests", "__tests__"} for part in file.parts[:-1])
+        any(part in {"test", "tests", "__tests__", "generated_tests"} for part in file.parts[:-1])
         or file.name.startswith("test_") or file.name.endswith("_test.py")
         or ".test." in file.name or ".spec." in file.name
     )
@@ -113,7 +120,7 @@ def validator_node(state: WorkflowState) -> dict:
             raise DiffError("Missing code or test artifact")
         if "<REDACTED" in patch.diff or "<REDACTED" in test_patch.diff:
             raise DiffError("A redacted patch requires manual reconstruction")
-        baseline = state.get("file_contents", {})
+        baseline = available_sources(state)
         stage = "code_patch_normalization"
         with trace_stage(stage):
             patch = replace(patch, diff=canonicalize_patch(patch.diff, baseline))
@@ -131,6 +138,10 @@ def validator_node(state: WorkflowState) -> dict:
             raise DiffError("Code patch changed an unreviewed path or renamed a file")
         if any(not _is_test_path(change.path) for change in test_changes):
             raise DiffError("Test patch changed a non-test file")
+        for change in test_changes:
+            if change.old_path is not None and change.path not in allowed:
+                file_path = change.path
+                raise DiffError("Existing test edits require explicit target scope; related context is read-only")
         if any(change.path.endswith(".py") and not PurePosixPath(change.path).name.startswith("test_") for change in test_changes):
             raise DiffError("Generated Python test filenames must match test_*.py for unittest discovery")
         if {change.path for change in code_changes} & {change.path for change in test_changes}:
@@ -140,6 +151,19 @@ def validator_node(state: WorkflowState) -> dict:
         if set(patch.finding_ids) != set(state["fix_plan"].finding_ids):
             raise DiffError("Patch references do not match plan")
         checks.append("finding_references")
+        if test_patch.status == "generated":
+            stage = "test_path_allocation"
+            with trace_stage(stage):
+                suffix = "__run_" + digest(state["run_id"])[:12] if state.get("write_root") and state.get("run_id") else ""
+                scoped = scope_new_tests(test_patch.diff, suffix)
+            if scoped != test_patch.diff:
+                test_patch = replace(test_patch, diff=scoped,
+                                     summary=test_patch.summary + " New test files are stored separately in generated_tests/.")
+                artifacts["test_patch"] = test_patch
+                test_changes = parse_diff(scoped)
+            checks.append("generated_test_paths")
+            if suffix:
+                checks.append("run_scoped_test_paths")
         missing = [change.old_path for change in [*code_changes, *test_changes] if change.old_path and change.old_path not in baseline]
         if missing:
             return {
@@ -201,6 +225,33 @@ def regression_reviewer_node(state: WorkflowState, model) -> dict:
     return {"regression": ValidationResult(reply.status, ("model_review",), reply.summary, scope="model")}
 
 
+def failure_diagnoser_node(state: WorkflowState, model) -> dict:
+    """Classify failed validation and collect missing evidence before a bounded repair retry."""
+    from src.react import invoke_react_json
+    observed = {}
+    reply = invoke_react_json(model, "failure_diagnoser",
+        "Diagnose this failed repair from structured validation/regression feedback, not guesses. "
+        "Distinguish code patch, test patch, missing context, regression, and unsupported work. "
+        "Use project tools to collect missing caller/configuration/contract evidence when needed. "
+        "action=collect_context requires actually collecting new source evidence. Give concrete repair "
+        "instructions; do not blindly repeat the previous plan. Choose stop if evidence cannot justify "
+        "a safe correction, or the attempt budget is exhausted. Never expand target/write scope or execute code.",
+        {**_repair_input(state), "patch": asdict(state["patch"]) if state.get("patch") else None,
+         "test_patch": asdict(state["test_patch"]) if state.get("test_patch") else None,
+         "validation": asdict(state.get("validation", ValidationResult())),
+         "regression": asdict(state.get("regression", ValidationResult())),
+         "remaining_attempts": max(0, state["max_fix_attempts"]-state["fix_attempts"])},
+        FailureDiagnosisReply, **react_options(state, observed))
+    diagnosis = reply.model_dump()
+    if reply.action == "collect_context" and not set(observed)-set(available_sources(state)):
+        diagnosis.update(action="stop", summary="No additional context was obtained. " + reply.summary)
+    if reply.category == "unsupported" or state["fix_attempts"] >= state["max_fix_attempts"]:
+        diagnosis["action"] = "stop"
+    diagnosis["attempt"] = state["fix_attempts"]
+    return {"failure_diagnosis": diagnosis, "failure_diagnoses": [*state.get("failure_diagnoses", []), diagnosis],
+            "observed_sources": {"failure_diagnoser": observed}}
+
+
 def file_writer_node(state: WorkflowState) -> dict:
     """Invoke write_file only for complete, validated repair candidates."""
     from pathlib import Path
@@ -219,10 +270,21 @@ def file_writer_node(state: WorkflowState) -> dict:
         artifact = state.get(key)
         if artifact and artifact.diff and any(change.new_path is None for change in parse_diff(artifact.diff)):
             raise FileWriteError("WRITE_DELETE_UNSUPPORTED")
-    writer = CandidateWriter(state["write_root"], sources=state.get("file_contents", {}),
+    writer = CandidateWriter(state["write_root"], sources=available_sources(state),
                              candidates=state["candidate_files"], run_dir=state["run_dir"])
     results = []
     with file_lock(Path(state["run_dir"]).parent/".write.lock", blocking=True):
+        from src.privacy import redact
+        from src.source_input import read_target
+        for path, expected in available_sources(state).items():
+            if path in state.get("project_inventory", {}) and path not in state["candidate_files"]:
+                with trace_stage("context_version_check", file_path=path):
+                    try:
+                        _, _, current = read_target(path, state["write_root"], run_root=Path(state["run_dir"]).parent)
+                    except (ValueError, OSError):
+                        raise FileWriteError("CONTEXT_VERSION_CHANGED") from None
+                    if redact(current) != expected:
+                        raise FileWriteError("CONTEXT_VERSION_CHANGED")
         with trace_stage("file_write_preflight"):
             writer.preflight()
         for path, content in sorted(state["candidate_files"].items()):

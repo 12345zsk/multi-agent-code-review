@@ -102,12 +102,56 @@ class ModelPatchTests(unittest.TestCase):
 
 
 class GeneratedTestValidationTests(unittest.TestCase):
-    def validate(self, source, path="tests/test_stats.py"):
+    def validate(self, source, path="tests/test_stats.py", **options):
         return validator_node({
             "patch": PatchArtifact("generated", unified(CURRENT, BEFORE, "stats.py"), ("f",)),
             "test_patch": PatchArtifact("generated", unified("", source, path, new=True), ("f",)),
             "fix_plan": FixPlan("ready", ("f",)), "file_paths": ["stats.py"], "file_contents": {"stats.py": CURRENT},
+            **options,
         })
+
+    def test_new_test_paths_are_stable_per_run_before_model_review(self):
+        tests = "import unittest\nclass Cases(unittest.TestCase):\n    def test_value(self):\n        self.assertTrue(True)\n"
+        results = [self.validate(tests, write_root="unused", run_id=run_id) for run_id in ("run-one", "run-two")]
+        paths = []
+        for result, run_id in zip(results, ("run-one", "run-two")):
+            self.assertEqual(result["validation"].status, "passed")
+            path = parse_diff(result["test_patch"].diff)[0].path
+            self.assertRegex(path, r"^generated_tests/test_stats__run_[a-f0-9]{12}\.py$")
+            self.assertEqual(result["candidate_files"][path], tests)
+            repeated = self.validate(tests, write_root="unused", run_id=run_id, test_patch=result["test_patch"])
+            self.assertEqual(repeated["test_patch"], result["test_patch"])
+            self.assertEqual(repeated["candidate_files"], result["candidate_files"])
+            paths.append(path)
+        self.assertNotEqual(paths[0], paths[1])
+
+    def test_existing_test_edits_keep_the_snapshotted_path(self):
+        original = "import unittest\nclass Cases(unittest.TestCase):\n    def test_value(self):\n        self.assertTrue(False)\n"
+        updated = original.replace("False", "True")
+        path = "tests/test_stats.py"
+        result = self.validate(updated, write_root="unused", run_id="run-one",
+                               file_paths=["stats.py", path],
+                               file_contents={"stats.py": CURRENT, path: original},
+                               test_patch=PatchArtifact("generated", unified(original, updated, path), ("f",)))
+        self.assertEqual(result["validation"].status, "passed")
+        self.assertEqual(parse_diff(result["test_patch"].diff)[0].path, path)
+        self.assertEqual(result["candidate_files"][path], updated)
+
+    def test_related_existing_tests_are_read_only_without_explicit_target_scope(self):
+        original = "import unittest\nclass Cases(unittest.TestCase):\n    def test_value(self):\n        self.assertTrue(False)\n"
+        path = "tests/test_stats.py"
+        result = self.validate("", file_contents={"stats.py": CURRENT},
+                               observed_sources={"bug_detector": {path: original}},
+                               test_patch=PatchArtifact("generated", unified(original, original.replace("False", "True"), path), ("f",)))
+        self.assertEqual(result["validation"].status, "failed")
+        self.assertEqual(result["validation"].file_path, path)
+        self.assertIn("read-only", result["validation"].summary)
+        self.assertEqual(result["candidate_files"], {})
+    def test_new_non_python_tests_also_use_the_generated_directory(self):
+        patch = PatchArtifact("generated", unified("", "check();\n", "tests/regression.js", new=True), ("f",))
+        result = self.validate("", test_patch=patch)
+        self.assertEqual(result["validation"].status, "passed")
+        self.assertEqual(result["candidate_files"]["generated_tests/regression.js"], "check();\n")
 
     def test_pytest_dependency_is_rejected(self):
         result = self.validate("import pytest\ndef test_empty():\n    assert True\n")
@@ -127,7 +171,7 @@ class GeneratedTestValidationTests(unittest.TestCase):
     def test_unittest_aliases_are_supported_without_executing_tests(self):
         result = self.validate("from unittest import TestCase as Case\nclass Checks(Case):\n    def test_empty(self):\n        raise RuntimeError('must not execute')\n")
         self.assertEqual(result["validation"].status, "passed")
-        self.assertIn("unittest_discovery:tests/test_stats.py", result["validation"].checks)
+        self.assertIn("unittest_discovery:generated_tests/test_stats.py", result["validation"].checks)
 
     def test_live_workflow_exports_the_canonical_artifacts(self):
         class BadCountsModel(DemoModel):
@@ -144,4 +188,4 @@ class GeneratedTestValidationTests(unittest.TestCase):
         self.assertEqual(result["status"], "proposed")
         self.assertEqual(result["fix_attempts"], 1)
         self.assertEqual(apply_patch({"stats.py": CURRENT}, parse_diff(result["patch"].diff))["stats.py"], BEFORE)
-        self.assertIn("tests/test_stats.py", apply_patch({}, parse_diff(result["test_patch"].diff)))
+        self.assertIn("generated_tests/test_stats.py", apply_patch({}, parse_diff(result["test_patch"].diff)))

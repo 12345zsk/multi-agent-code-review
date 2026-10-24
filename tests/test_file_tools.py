@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from examples.repair_demo import BEFORE, CURRENT, DemoModel, SAMPLE_DIFF, TESTS, unified
 from src.cli import main
+from src.diff import parse_diff
 from src.file_tools import CandidateWriter, FileWriteError, _replace
 from src.workflow.service import resume_workflow, run_workflow
 
@@ -56,7 +57,7 @@ class FileToolTests(unittest.TestCase):
             (root/"tests").mkdir()
             target = root/"tests/test_stats.py"
             target.write_text("existing user tests\n")
-            with self.assertRaises(FileWriteError):
+            with self.assertRaisesRegex(FileWriteError, "WRITE_NEW_FILE_EXISTS"):
                 writer.preflight()
             self.assertEqual(target.read_text(), "existing user tests\n")
             target.unlink()
@@ -118,7 +119,9 @@ class WriteWorkflowTests(unittest.TestCase):
             self.assertEqual(result["status"], "proposed")
             self.assertEqual(result["write_result"]["status"], "written")
             self.assertEqual((root/"stats.py").read_text(), BEFORE)
-            self.assertEqual((root/"tests/test_stats.py").read_text(), TESTS)
+            test_path = parse_diff(result["test_patch"].diff)[0].path
+            self.assertRegex(test_path, r"^generated_tests/test_stats__run_[a-f0-9]{12}\.py$")
+            self.assertEqual((root/test_path).read_text(), TESTS)
             self.assertEqual(result["runtime_validation"].status, "not_run")
             self.assertNotIn("repository files were not changed", result["final_review"])
             manifest = json.loads((Path(result["run_dir"])/"manifest.json").read_text())
@@ -149,39 +152,78 @@ class WriteWorkflowTests(unittest.TestCase):
                 self.assertEqual(result["status"], "failed")
                 self.assertEqual((root/"stats.py").read_text(), CURRENT)
                 self.assertFalse((root/"tests").exists())
+                self.assertFalse((root/"generated_tests").exists())
                 self.assertFalse((Path(result["run_dir"])/"writes").exists())
 
     def test_preflight_checks_all_targets_before_any_write(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root/"stats.py").write_text(CURRENT)
-            (root/"tests").mkdir()
-            (root/"tests/test_stats.py").write_text("existing user tests\n")
-            result = self.execute(root)
+            collisions = []
+            class ConcurrentTest(DemoModel):
+                def invoke(self, messages):
+                    if messages[0].content.startswith("ROLE: regression_reviewer\n"):
+                        payload = json.loads(messages[1].content)
+                        path = next(p for p in payload["candidate_sources"] if p.startswith("generated_tests/"))
+                        (root/path).parent.mkdir(parents=True, exist_ok=True)
+                        (root/path).write_text("existing user tests\n")
+                        collisions.append(path)
+                    return super().invoke(messages)
+            result = self.execute(root, ConcurrentTest())
             self.assertEqual(result["status"], "failed")
             self.assertEqual((root/"stats.py").read_text(), CURRENT)
-            self.assertEqual((root/"tests/test_stats.py").read_text(), "existing user tests\n")
+            self.assertEqual((root/collisions[0]).read_text(), "existing user tests\n")
+            self.assertTrue(any(item["error_code"] == "WRITE_NEW_FILE_EXISTS" for item in result["diagnostics"]))
             self.assertFalse((Path(result["run_dir"])/"writes").exists())
+
+    def test_repeated_runs_preserve_existing_tests_and_use_distinct_new_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"tests").mkdir()
+            existing = root/"tests/test_stats.py"
+            original = b"# Existing user regression tests must be preserved.\n"
+            existing.write_bytes(original)
+            paths = []
+            for _ in range(2):
+                (root/"stats.py").write_text(CURRENT)
+                result = self.execute(root)
+                self.assertEqual(result["status"], "proposed")
+                self.assertEqual(result["write_result"]["status"], "written")
+                self.assertEqual((root/"stats.py").read_text(), BEFORE)
+                self.assertEqual(existing.read_bytes(), original)
+                self.assertEqual(list((root/"tests").iterdir()), [existing])
+                path = parse_diff(result["test_patch"].diff)[0].path
+                self.assertEqual((root/path).read_text(), TESTS)
+                self.assertIn(path, result["final_review"])
+                self.assertTrue(any(item["file_path"] == path for item in result["write_result"]["files"]))
+                paths.append(path)
+            self.assertNotEqual(paths[0], paths[1])
+            self.assertEqual((root/paths[0]).read_text(), TESTS)
 
     def test_partial_write_resume_reuses_receipt_and_keeps_original_backup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root/"stats.py").write_text(CURRENT)
-            def fail_test_write(path, data, mode=0o600):
-                if path == (root/"tests/test_stats.py").resolve():
+            def fail_source_write(path, data, mode=0o600):
+                if path == (root/"stats.py").resolve():
                     raise OSError("Synthetic write failure")
                 return _replace(path, data, mode)
-            with patch("src.file_tools._replace", side_effect=fail_test_write):
+            with patch("src.file_tools._replace", side_effect=fail_source_write):
                 failed = self.execute(root)
             self.assertEqual(failed["status"], "failed")
             self.assertEqual(failed["write_result"]["status"], "partial")
-            self.assertEqual((root/"stats.py").read_text(), BEFORE)
-            self.assertFalse((root/"tests/test_stats.py").exists())
+            self.assertEqual((root/"stats.py").read_text(), CURRENT)
+            test_path = parse_diff(failed["test_patch"].diff)[0].path
+            self.assertEqual((root/test_path).read_text(), TESTS)
             resumed = resume_workflow(failed["run_id"], run_root=root/"output/runs", model=DemoModel())
             self.assertEqual(resumed["status"], "proposed")
-            self.assertEqual((root/"tests/test_stats.py").read_text(), TESTS)
+            self.assertEqual(parse_diff(resumed["test_patch"].diff)[0].path, test_path)
+            self.assertEqual((root/test_path).read_text(), TESTS)
+            self.assertEqual((root/"stats.py").read_text(), BEFORE)
+            test_entry = next(item for item in resumed["write_result"]["files"] if item["file_path"] == test_path)
+            self.assertEqual(test_entry["status"], "already_written")
             entry = next(item for item in resumed["write_result"]["files"] if item["file_path"] == "stats.py")
-            self.assertEqual(entry["status"], "already_written")
+            self.assertEqual(entry["status"], "written")
             self.assertEqual((Path(resumed["run_dir"])/entry["backup"]).read_text(), CURRENT)
             starts = [item["node"] for item in resumed["trace_events"] if item["event"] == "node_started"]
             self.assertEqual(starts.count("patch_generator"), 1)
@@ -199,6 +241,7 @@ class WriteWorkflowTests(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertEqual((root/"stats.py").read_text(), "user edit while reviewing\n")
             self.assertFalse((root/"tests").exists())
+            self.assertFalse((root/"generated_tests").exists())
             self.assertTrue(any(item["error_code"] == "FILE_VERSION_CHANGED" for item in result["diagnostics"]))
 
     def test_write_requires_explicit_fix_mode_and_persistent_history(self):
@@ -211,7 +254,7 @@ class WriteWorkflowTests(unittest.TestCase):
     def test_cli_write_files_updates_local_source_and_exports_report(self):
         class NativeReadModel(DemoModel):
             def bind_tools(self, tools, **kwargs):
-                assert [item.name for item in tools] == ["read_source"]
+                assert {item.name for item in tools} == {"read_source", "list_project_files", "search_code", "analyze_python"}
                 return self
             def invoke(self, messages):
                 if messages[0].content.startswith("ROLE: bug_detector\n") and not any(isinstance(item, ToolMessage) for item in messages):

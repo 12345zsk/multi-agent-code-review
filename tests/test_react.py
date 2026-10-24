@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from examples.repair_demo import CURRENT, DemoModel, SAMPLE_DIFF
 from src.cli import main
 from src.model_agent import ModelOutputError
-from src.react import invoke_react_json, make_read_source
+from src.react import MAX_TOOL_CALLS, invoke_react_json, make_read_source
 from src.schemas import ReviewReply
 from src.workflow.registry import AGENT_IDS
 from src.workflow.service import resume_workflow, run_workflow
@@ -29,7 +29,7 @@ def request(args=None, *, name="read_source", call_id="read-1"):
 
 class ReadModel(DemoModel):
     def bind_tools(self, tools, **kwargs):
-        assert [tool.name for tool in tools] == ["read_source"]
+        assert {tool.name for tool in tools} == {"read_source", "list_project_files", "search_code", "analyze_python"}
         return self
 
     def invoke(self, messages):
@@ -71,7 +71,7 @@ class ReadSourceTests(unittest.TestCase):
 class ReactTests(unittest.TestCase):
     def run_review(self, model, **kwargs):
         return run_workflow(SAMPLE_DIFF, model=model,
-                            active_agents=["bug_detector"], file_contents={"stats.py": CURRENT}, **kwargs)
+                            file_contents={"stats.py": CURRENT}, **kwargs)
 
     def test_tool_result_returns_to_model_and_final_findings_are_validated(self):
         class Observing(ReadModel):
@@ -112,16 +112,48 @@ class ReactTests(unittest.TestCase):
         events = [event for event in result["trace_events"] if event["event"] == "tool_completed"]
         self.assertEqual([event["status"] for event in events], ["error", "ok"])
 
-    def test_unknown_tools_parallel_calls_and_reused_ids_are_rejected(self):
-        parallel = request()
-        parallel.tool_calls.append({"name": "read_source", "args": {"file_path": "stats.py"}, "id": "read-2", "type": "tool_call"})
-        for response in (request(name="write_file"), parallel):
+    def test_legal_batch_returns_all_observations_in_order_before_next_model_request(self):
+        class Batch(ReadModel):
+            def invoke(self, messages):
+                if messages[0].content.startswith("ROLE: review_planner\n"):
+                    observations = [m for m in messages if isinstance(m, ToolMessage)]
+                    if not observations:
+                        return AIMessage(content="", tool_calls=[request().tool_calls[0],
+                            request(name="analyze_python", call_id="ast-2").tool_calls[0]])
+                    assert [m.tool_call_id for m in observations] == ["read-1", "ast-2"]
+                    assert all(json.loads(m.content)["status"] == "ok" for m in observations)
+                return DemoModel.invoke(self, messages)
+
+        result = self.run_review(Batch())
+        self.assertEqual(result["status"], "completed", result["errors"])
+        events = [e for e in result["trace_events"] if e["event"] == "tool_completed"]
+        self.assertEqual([e["tool_call_id"] for e in events], ["read-1", "ast-2"])
+        step = next(e for e in result["trace_events"] if e["event"] == "react_step")
+        self.assertEqual(step["tool_names"], ["read_source", "analyze_python"])
+        self.assertEqual(step["tool_call_count"], 2)
+
+    def test_unknown_tools_and_reused_ids_are_rejected_before_batch_execution(self):
+        mixed = AIMessage(content="", tool_calls=[request().tool_calls[0],
+            request(name="write_file", call_id="write-2").tool_calls[0]])
+        for response in (request(name="write_file"), mixed):
             class Forbidden(ReadModel):
                 def invoke(self, messages):
                     return response
             with self.subTest(response=response.tool_calls), self.assertRaises(ModelOutputError) as error:
-                invoke_react_json(Forbidden(), "test", "Review", {}, ReviewReply, sources={"stats.py": CURRENT})
+                with patch("src.project_tools.ProjectContext.read") as read:
+                    try:
+                        invoke_react_json(Forbidden(), "test", "Review", {}, ReviewReply, sources={"stats.py": CURRENT})
+                    finally:
+                        read.assert_not_called()
             self.assertEqual(error.exception.code, "TOOL_NOT_ALLOWED")
+
+        duplicate = AIMessage(content="", tool_calls=[request().tool_calls[0], request().tool_calls[0]])
+        class Duplicate(ReadModel):
+            def invoke(self, messages):
+                return duplicate
+        with self.assertRaises(ModelOutputError) as error:
+            invoke_react_json(Duplicate(), "test", "Review", {}, ReviewReply, sources={"stats.py": CURRENT})
+        self.assertEqual(error.exception.code, "TOOL_CALL_ID_INVALID")
 
         class Reused(ReadModel):
             def invoke(self, messages):
@@ -130,14 +162,187 @@ class ReactTests(unittest.TestCase):
             invoke_react_json(Reused(), "test", "Review", {}, ReviewReply, sources={"stats.py": CURRENT})
         self.assertEqual(error.exception.code, "TOOL_CALL_ID_INVALID")
 
+    def test_batch_reserves_remaining_budget_before_executing_any_of_its_calls(self):
+        class BatchLoop(ReadModel):
+            def invoke(self, messages):
+                count = sum(isinstance(m, ToolMessage) for m in messages)
+                return AIMessage(content="", tool_calls=[request(call_id=f"read-{count+i}").tool_calls[0]
+                                                        for i in range(3)])
+        result = self.run_review(BatchLoop())
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(any(d["error_code"] == "REACT_FINAL_ANSWER_REQUIRED" for d in result["diagnostics"]))
+        self.assertEqual(sum(e["event"] == "tool_completed" for e in result["trace_events"]), 6)
+
+    def test_resume_in_middle_of_batch_does_not_repeat_completed_tool(self):
+        class Batch(ReadModel):
+            def invoke(self, messages):
+                if messages[0].content.startswith("ROLE: review_planner\n"):
+                    observations = [m for m in messages if isinstance(m, ToolMessage)]
+                    if not observations:
+                        return AIMessage(content="", tool_calls=[request(call_id=f"read-{i}").tool_calls[0]
+                                                                for i in range(2)])
+                    assert [m.tool_call_id for m in observations] == ["read-0", "read-1"]
+                return DemoModel.invoke(self, messages)
+
+        from src.project_tools import ProjectContext
+        original_read = ProjectContext.read
+        reads = []
+        def interrupt_second(context, path):
+            reads.append(path)
+            if len(reads) == 2:
+                raise RuntimeError("SYNTHETIC_BATCH_INTERRUPTION")
+            return original_read(context, path)
+
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(ProjectContext, "read", interrupt_second):
+                failed = self.run_review(Batch(), run_root=root)
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(sum(e["event"] == "tool_completed" for e in failed["trace_events"]), 1)
+            resumed = resume_workflow(failed["run_id"], run_root=root, model=Batch())
+            self.assertEqual(resumed["status"], "completed", resumed["errors"])
+            self.assertEqual([e["tool_call_id"] for e in resumed["trace_events"] if e["event"] == "tool_completed"],
+                             ["read-0", "read-1"])
+
     def test_tool_loop_is_bounded_and_cannot_report_success(self):
         class Loop(ReadModel):
             def invoke(self, messages):
                 return request(call_id=f"read-{sum(isinstance(message, ToolMessage) for message in messages)}")
         result = self.run_review(Loop())
         self.assertEqual(result["status"], "failed")
-        self.assertTrue(any(item["error_code"] == "REACT_TOOL_LIMIT_EXCEEDED" for item in result["diagnostics"]))
-        self.assertEqual(sum(event["event"] == "tool_completed" for event in result["trace_events"]), 3)
+        self.assertTrue(any(item["error_code"] == "REACT_FINAL_ANSWER_REQUIRED" for item in result["diagnostics"]))
+        self.assertEqual(sum(event["event"] == "tool_completed" for event in result["trace_events"]), MAX_TOOL_CALLS)
+
+    def test_budget_exhaustion_uses_model_without_tools_and_reaches_adjudication(self):
+        class BudgetReader(ReadModel):
+            def bind_tools(self, tools, **kwargs):
+                parent = self
+                class Bound:
+                    def invoke(self, messages):
+                        if messages[0].content.startswith("ROLE: bug_detector\n"):
+                            count = sum(isinstance(m, ToolMessage) for m in messages)
+                            assert f"remaining_tool_calls={MAX_TOOL_CALLS-count}" in messages[0].content
+                            assert count < MAX_TOOL_CALLS, "Exhausted calls must use the unbound model"
+                            return AIMessage(content="", tool_calls=[
+                                request(call_id="read-0").tool_calls[0] if count+i == 0 else
+                                request({"query": "average"}, name="search_code", call_id=f"search-{count+i}").tool_calls[0]
+                                for i in range(2)])
+                        return DemoModel.invoke(parent, messages)
+                return Bound()
+
+            def invoke(self, messages):
+                if messages[0].content.startswith("ROLE: bug_detector\n"):
+                    assert "remaining_tool_calls=0" in messages[0].content
+                    assert "Do not request tools" in messages[0].content
+                    assert sum(isinstance(m, ToolMessage) for m in messages) == MAX_TOOL_CALLS
+                return DemoModel.invoke(self, messages)
+
+        result = self.run_review(BudgetReader())
+        self.assertEqual(result["status"], "completed", result["errors"])
+        self.assertEqual(result["findings"][0].status, "confirmed")
+        self.assertEqual(sum(e["event"] == "tool_completed" for e in result["trace_events"]), MAX_TOOL_CALLS)
+        self.assertEqual(sum(e["event"] == "tool_completed" and e["tool"] == "search_code"
+                             for e in result["trace_events"]), 7)
+        self.assertTrue(any(e["event"] == "react_finalization" for e in result["trace_events"]))
+        self.assertIn("Context collection limited", result["final_review"])
+
+    def test_final_json_retry_after_eight_single_calls_respects_model_request_limit(self):
+        class Finishing(ReadModel):
+            def __init__(self):
+                self.requests = 0
+            def invoke(self, messages):
+                self.requests += 1
+                assert f"remaining_model_requests={11-self.requests}" in messages[0].content
+                count = sum(isinstance(m, ToolMessage) for m in messages)
+                if count < MAX_TOOL_CALLS:
+                    return request(call_id=f"read-{count}")
+                if isinstance(messages[-1], ToolMessage):
+                    return AIMessage(content="SYNTHETIC_INVALID_FINAL_JSON")
+                return AIMessage(content='{"summary":"Limited to supplied evidence.","findings":[]}')
+
+        model = Finishing()
+        result = invoke_react_json(model, "test", "Review", {}, ReviewReply, sources={"stats.py": CURRENT})
+        self.assertEqual(model.requests, 10)
+        self.assertEqual(result.findings, [])
+
+    def test_oversized_batch_gets_error_observations_and_bounded_final_json_retry(self):
+        class Oversized(ReadModel):
+            def __init__(self):
+                self.final_attempts = 0
+            def bind_tools(self, tools, **kwargs):
+                class Bound:
+                    def invoke(self, messages):
+                        assert "remaining_tool_calls=8" in messages[0].content
+                        return AIMessage(content="", tool_calls=[request(call_id=f"read-{i}").tool_calls[0]
+                                                                for i in range(MAX_TOOL_CALLS+1)])
+                return Bound()
+            def invoke(self, messages):
+                observations = [m for m in messages if isinstance(m, ToolMessage)]
+                assert [m.tool_call_id for m in observations] == [f"read-{i}" for i in range(MAX_TOOL_CALLS+1)]
+                assert all(json.loads(m.content)["code"] == "REACT_TOOL_LIMIT_EXCEEDED" for m in observations)
+                assert "Do not request tools" in messages[0].content
+                self.final_attempts += 1
+                if self.final_attempts == 1:
+                    return AIMessage(content="SYNTHETIC_INVALID_FINAL_RESPONSE")
+                assert "SYNTHETIC_INVALID_FINAL_RESPONSE" not in str(messages)
+                return AIMessage(content='{"summary":"Evidence is limited.","findings":[]}')
+
+        model = Oversized()
+        with patch("src.project_tools.ProjectContext.read") as read:
+            result = invoke_react_json(model, "test", "Review", {}, ReviewReply, sources={"stats.py": CURRENT})
+            read.assert_not_called()
+        self.assertEqual(result.findings, [])
+        self.assertEqual(model.final_attempts, 2)
+
+    def test_limited_context_with_no_findings_does_not_report_approval(self):
+        class NoEvidence(ReadModel):
+            def bind_tools(self, tools, **kwargs):
+                parent = self
+                class Bound:
+                    def invoke(self, messages):
+                        if messages[0].content.startswith("ROLE: bug_detector\n"):
+                            return AIMessage(content="", tool_calls=[request(call_id=f"read-{i}").tool_calls[0]
+                                                                    for i in range(MAX_TOOL_CALLS+1)])
+                        data = DemoModel.invoke(parent, messages)
+                        if messages[0].content.splitlines()[0].removeprefix("ROLE: ") in AGENT_IDS:
+                            return AIMessage(content='{"summary":"No evidence.","findings":[]}')
+                        return data
+                return Bound()
+            def invoke(self, messages):
+                return AIMessage(content='{"summary":"Insufficient evidence.","findings":[]}')
+
+        result = self.run_review(NoEvidence())
+        self.assertEqual(result["status"], "completed", result["errors"])
+        self.assertIn("NEEDS DISCUSSION", result["final_review"])
+        self.assertIn("Context collection limited", result["final_review"])
+        self.assertNotIn("APPROVE", result["final_review"])
+
+    def test_resume_at_budget_finalization_keeps_observations_without_repeating_tools(self):
+        class Interrupted(ReadModel):
+            def __init__(self, interrupt):
+                self.interrupt = interrupt
+            def bind_tools(self, tools, **kwargs):
+                parent = self
+                class Bound:
+                    def invoke(self, messages):
+                        if messages[0].content.startswith("ROLE: bug_detector\n"):
+                            return AIMessage(content="", tool_calls=[request(call_id=f"read-{i}").tool_calls[0]
+                                                                    for i in range(MAX_TOOL_CALLS)])
+                        return DemoModel.invoke(parent, messages)
+                return Bound()
+            def invoke(self, messages):
+                if messages[0].content.startswith("ROLE: bug_detector\n"):
+                    assert sum(isinstance(m, ToolMessage) for m in messages) == MAX_TOOL_CALLS
+                    if self.interrupt:
+                        raise ConnectionError("SYNTHETIC_FINALIZATION_INTERRUPTION")
+                return DemoModel.invoke(self, messages)
+
+        with tempfile.TemporaryDirectory() as root:
+            failed = self.run_review(Interrupted(True), run_root=root)
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(sum(e["event"] == "tool_completed" for e in failed["trace_events"]), MAX_TOOL_CALLS)
+            resumed = resume_workflow(failed["run_id"], run_root=root, model=Interrupted(False))
+            self.assertEqual(resumed["status"], "completed", resumed["errors"])
+            self.assertEqual(sum(e["event"] == "tool_completed" for e in resumed["trace_events"]), MAX_TOOL_CALLS)
 
     def test_final_json_retry_preserves_observation_without_rereading(self):
         class Formatting(ReadModel):
@@ -167,6 +372,7 @@ class ReactTests(unittest.TestCase):
             resumed = resume_workflow(failed["run_id"], run_root=root, model=ReadModel())
             self.assertEqual(resumed["status"], "completed")
             self.assertEqual(sum(event["event"] == "tool_completed" for event in resumed["trace_events"]), 1)
+            self.assertEqual(len(resumed["reports"]["bug_detector"].tool_observations), 1)
 
     def test_react_fix_retains_existing_validation_pipeline(self):
         result = self.run_review(ReadModel(), mode="fix")
