@@ -10,7 +10,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.diff import safe_path
-from src.privacy import redact
+from src.privacy import is_sensitive_path, redact
 from src.runtime.store import write_json
 
 
@@ -65,7 +65,7 @@ class CandidateWriter:
         if relative not in self.candidates or content != self.candidates[relative]:
             raise FileWriteError("WRITE_CANDIDATE_MISMATCH")
         parts = Path(relative).parts
-        if any(part.lower() == ".git" or part.lower().startswith(".env") for part in parts) or Path(relative).suffix.lower() in {".key", ".pem", ".p12"}:
+        if is_sensitive_path((self.root/relative).as_posix()):
             raise FileWriteError("WRITE_PATH_FORBIDDEN")
         target = self.root
         for part in parts:

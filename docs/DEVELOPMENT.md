@@ -51,7 +51,7 @@
 ```bash
 python -m unittest discover -s tests -v
 python -m examples.repair_demo
-code-review --scaffold --file examples/review_target.diff
+code-review --scaffold --file examples/order_project.diff
 code-review --graph --output output/workflow.mmd
 ```
 

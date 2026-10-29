@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from examples.repair_demo import BEFORE, CURRENT, unified
+from evals.cases import load_cases
 from evals.scoring import aggregate, annotation_template, score_report
 from evals.run_eval import run
 
@@ -146,6 +148,23 @@ class EvaluationTests(unittest.TestCase):
 
 
 class EvaluationCliTests(unittest.TestCase):
+    def test_live_batch_passes_project_sources_and_review_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = [{"name": scope, "review_scope": scope, "source_root": root,
+                      "file_paths": ["api.py"], "diff": "synthetic input",
+                      "sources": {"api.py": "value = 1\n"}, "labels": LABELS}
+                     for scope in ("file", "diff")]
+            with chdir(root), patch("sys.argv", ["eval"]), patch("evals.cases.load_cases", return_value=cases), patch(
+                "src.workflow.service.run_workflow", return_value=report()
+            ) as workflow, redirect_stdout(StringIO()):
+                run()
+            self.assertEqual(workflow.call_count, 2)
+            for call, case in zip(workflow.call_args_list, cases):
+                self.assertEqual(call.kwargs["review_scope"], case["review_scope"])
+                self.assertEqual(call.kwargs["source_root"], root)
+                self.assertEqual(call.kwargs["file_contents"], case["sources"])
+
     def test_saved_result_and_human_template_require_no_model_calls(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -170,3 +189,26 @@ class EvaluationCliTests(unittest.TestCase):
                 run()
             self.assertEqual(error.exception.code, 1)
             self.assertEqual(json.loads((root/"output/evaluation.json").read_text())["summary"]["metrics"]["false_negatives"], 1)
+
+
+class ProjectCaseTests(unittest.TestCase):
+    def test_file_and_diff_cases_validate_versions_without_reading_model_answers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root/"examples/order_project/app"
+            app.mkdir(parents=True)
+            (root/"evals/labels").mkdir(parents=True)
+            target = app/"stats.py"
+            target.write_text(CURRENT)
+            (root/"examples/order_project.diff").write_text(unified(BEFORE, CURRENT, "app/stats.py"))
+            labels = {"case_id": "fixture", "expected": [],
+                      "source_hashes": {"app/stats.py": hashlib.sha256(CURRENT.encode()).hexdigest()}}
+            for name in ("order_project", "order_project_diff"):
+                (root/"evals/labels"/(name+".json")).write_text(json.dumps(labels))
+            with patch("evals.cases.__file__", str(root/"evals/cases.py")):
+                cases = load_cases()
+                self.assertEqual([c["review_scope"] for c in cases], ["file", "diff"])
+                self.assertEqual(cases[0]["sources"], {"app/stats.py": CURRENT})
+                target.write_text("changed = True\n")
+                with self.assertRaisesRegex(ValueError, "restore"):
+                    load_cases()

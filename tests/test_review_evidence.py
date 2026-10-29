@@ -1,24 +1,24 @@
 """Evidence coordinates and boundaries, without model calls or target execution."""
 
-from pathlib import Path
 import unittest
 
 from examples.repair_demo import CURRENT, SAMPLE_DIFF, unified
 from src.diff import parse_diff
 from src.model_agent import ModelOutputError
 from src.review.evidence import evidence_spans, locate_evidence, supplied_evidence
+from src.source_input import source_snapshot
 
 
 class EvidenceTests(unittest.TestCase):
     def test_representative_fixture_corrects_blank_line_references(self):
-        root = Path(__file__).resolve().parents[1]
-        source = (root / "examples/review_target.py").read_text(encoding="utf-8")
-        change = parse_diff((root / "examples/review_target.diff").read_text(encoding="utf-8"))[0]
-        for actual, wrong in ((33, 35), (51, 53)):
-            evidence = source.splitlines()[actual - 1].strip()
-            with self.subTest(actual=actual):
-                self.assertEqual(locate_evidence(change, source, evidence, wrong), actual)
-                self.assertEqual(locate_evidence(change, None, evidence, wrong), actual)
+        # Keep framework evidence tests independent of mutable online inputs.
+        source = "def first(value):\n    return value + 1\n\n\ndef second(value):\n    return value * 2\n"
+        change = parse_diff(source_snapshot("app/service.py", source))[0]
+        for evidence in ("    return value + 1", "    return value * 2"):
+            actual = source.splitlines().index(evidence) + 1
+            with self.subTest(evidence=evidence):
+                self.assertEqual(locate_evidence(change, source, evidence, actual+2), actual)
+                self.assertEqual(locate_evidence(change, None, evidence, actual+2), actual)
 
     def test_missing_or_out_of_range_hint_uses_unique_excerpt(self):
         change = parse_diff(SAMPLE_DIFF)[0]

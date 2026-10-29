@@ -40,6 +40,18 @@ class SourceModel(DemoModel):
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_explicit_sensitive_targets_are_rejected_before_opening(self):
+        for relative in (".ssh/id_rsa", ".aws/credentials", ".azure/profile.json", ".kube/config",
+                         ".npmrc", ".netrc", ".pypirc", "keys/client.pfx", "keys/client.ppk"):
+            with self.subTest(path=relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root/relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("SYNTHETIC_PRIVATE_FILE")
+                with patch.object(Path, "open", side_effect=AssertionError("Sensitive file must not be opened")):
+                    with self.assertRaisesRegex(ValueError, "sensitive"):
+                        read_target(relative, root)
+
     def test_basename_lookup_skips_generated_tests_but_explicit_paths_work(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from threading import Barrier
 import unittest
 from unittest.mock import patch
 
@@ -64,6 +65,30 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(next(item for item in resumed["diagnostics"] if item["node"] == "security")["resolved"])
             self.assertEqual(resumed["run_id"], failed["run_id"])
             self.assertEqual(RunStore.open(root, failed["run_id"]).metadata["resumes"], 1)
+
+    def test_all_parallel_failures_are_reported_and_resolve_after_resume(self):
+        barrier = Barrier(2, timeout=10)
+
+        def fail_two(role, data):
+            if role in {"bug_detector", "security"}:
+                barrier.wait()
+                raise ConnectionError("Synthetic parallel failure")
+            return data
+
+        with tempfile.TemporaryDirectory() as root:
+            failed = self.execute(root, ChangedModel(fail_two))
+            self.assertEqual(sum(item["node"] in {"bug_detector", "security"}
+                                 for item in failed["diagnostics"]), 2)
+            for agent in ("bug_detector", "security"):
+                self.assertTrue(any(item["node"] == agent and not item["resolved"] for item in failed["diagnostics"]))
+                self.assertEqual(failed["reports"][agent].status, "failed")
+                self.assertIn(f"- {agent}: failed", failed["final_review"])
+                self.assertTrue(any(error.startswith(f"{agent}:") for error in failed["errors"]))
+            resumed = resume_workflow(failed["run_id"], run_root=root, model=DemoModel())
+            self.assertEqual(resumed["status"], "proposed")
+            for agent in ("bug_detector", "security"):
+                self.assertEqual(resumed["reports"][agent].status, "completed")
+                self.assertFalse(any(item["node"] == agent and not item["resolved"] for item in resumed["diagnostics"]))
 
     def test_abrupt_process_death_recovers_from_committed_checkpoint(self):
         script = '''import os,sys
@@ -235,6 +260,65 @@ run_workflow(SAMPLE_DIFF,mode='fix',model=KilledModel(),file_contents={'stats.py
                             test_path=destination/"tests.diff", output_root=destination)
             self.assertEqual((destination/"report.md").read_text(), "keep previous report")
 
+    def test_export_paths_cannot_collide_with_publication_indexes_or_lock(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            result = self.execute(root/"runs")
+            store = RunStore.open(root/"runs", result["run_id"])
+            destination = root/"output"
+            destination.mkdir()
+            previous = {}
+            for name in ("report.md", "latest.json", "latest-review.json", "latest-fix.json", ".publish.lock"):
+                previous[name] = "Previous " + name
+                (destination/name).write_text(previous[name])
+            for name in ("latest.json", "latest-review.json", "latest-fix.json", ".publish.lock"):
+                for key in ("report_path", "patch_path", "test_path"):
+                    with self.subTest(name=name, output=key):
+                        paths = dict(report_path=destination/"report.md", patch_path=destination/"repair.diff",
+                                     test_path=destination/"tests.diff")
+                        paths[key] = destination/name
+                        with self.assertRaisesRegex(ValueError, "reserved"):
+                            publish_run(store, **paths, output_root=destination)
+                        for path, content in previous.items():
+                            self.assertEqual((destination/path).read_text(), content)
+
+    def test_source_collision_protection_survives_a_different_publication_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"stats.py").write_text(CURRENT)
+            with chdir(root):
+                result = run_workflow(SAMPLE_DIFF, model=DemoModel(), run_root=root/"runs")
+            store = RunStore.open(root/"runs", result["run_id"])
+            destination = root/"output"
+            destination.mkdir()
+            with chdir(destination), self.assertRaisesRegex(ValueError, "must not overwrite"):
+                publish_run(store, report_path=root/"stats.py", patch_path=destination/"repair.diff",
+                            test_path=destination/"tests.diff", output_root=destination)
+            self.assertEqual((root/"stats.py").read_text(), CURRENT)
+
+    def test_legacy_execution_identifier_can_still_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = self.execute(root/"runs")
+            store = RunStore.open(root/"runs", result["run_id"])
+            store.metadata["session_id"] = store.metadata.pop("execution_id")
+            # Reproduce the old on-disk format, before Session redaction existed.
+            (store.path/"manifest.json").write_text(json.dumps(store.metadata))
+            destination = root/"output"
+            latest = publish_run(store, report_path=destination/"report.md", patch_path=destination/"repair.diff",
+                                 test_path=destination/"tests.diff", output_root=destination)
+            self.assertTrue(latest["candidate_valid"])
+
+    def test_legacy_interrupted_trace_keeps_execution_provenance(self):
+        from src.runtime.tracing import TraceRecorder
+        tracer = TraceRecorder("synthetic-run")
+        tracer.events = [{"sequence": 1, "event": "node_started", "span_id": "synthetic-span", "attempt": 0,
+                          "node": "security", "finding_ids": [], "session_id": "synthetic-previous-execution"}]
+        tracer.record_interrupted_spans()
+        event = tracer.events[-1]
+        self.assertEqual(event["previous_execution_id"], "synthetic-previous-execution")
+        self.assertEqual(event["execution_id"], tracer.session_id)
+
     def test_finished_checkpoint_can_be_republished_after_finalization_crash(self):
         with tempfile.TemporaryDirectory() as root:
             result = self.execute(root)
@@ -324,6 +408,67 @@ class ArtifactCliTests(unittest.TestCase):
             self.assertFalse((root/"output/repair.diff").exists())
             self.assertTrue(list((Path(latest["run_dir"])/"drafts").rglob("repair.diff")))
 
+    def test_modified_previous_patch_is_preserved_and_not_published_as_current(self):
+        for filename in ("repair.diff", "tests.diff"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root/"input.diff").write_text(SAMPLE_DIFF)
+                (root/"stats.py").write_text(CURRENT)
+                self.assertEqual(self.invoke(root, DemoModel()), 0)
+                target = root/"output"/filename
+                target.write_text("User changed this file after publication\n")
+                self.assertEqual(self.invoke(root, ChangedModel(invalid_patch), ["--max-fix-attempts", "1"]), 1)
+                self.assertEqual(target.read_text(), "User changed this file after publication\n")
+                latest = json.loads((root/"output/latest.json").read_text())
+                self.assertNotIn(filename, latest["exports"])
+                self.assertFalse(latest["candidate_valid"])
+                self.assertEqual(latest["preserved_outputs"], [{"path": str(target.resolve()), "reason": "ownership_or_content_unverified"}])
+
+    def test_invalid_or_missing_ownership_metadata_never_authorizes_cleanup(self):
+        for metadata in ("not json", "[]", '{"schema_version": 1, "exports": []}'):
+            with self.subTest(metadata=metadata), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root/"input.diff").write_text(SAMPLE_DIFF)
+                (root/"stats.py").write_text(CURRENT)
+                (root/"output").mkdir()
+                target = root/"output/repair.diff"
+                target.write_text("Unowned existing content\n")
+                (root/"output/latest.json").write_text(metadata)
+                self.assertEqual(self.invoke(root, DemoModel(), ["--mode", "review"]), 0)
+                self.assertEqual(target.read_text(), "Unowned existing content\n")
+
+    def test_same_patch_content_at_an_unowned_path_is_not_deleted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"input.diff").write_text(SAMPLE_DIFF)
+            (root/"stats.py").write_text(CURRENT)
+            self.assertEqual(self.invoke(root, DemoModel()), 0)
+            unrelated = root/"saved_by_user.diff"
+            content = (root/"output/repair.diff").read_bytes()
+            unrelated.write_bytes(content)
+            self.assertEqual(self.invoke(root, DemoModel(), ["--mode", "review", "--patch-output", str(unrelated)]), 0)
+            self.assertEqual(unrelated.read_bytes(), content)
+            latest = json.loads((root/"output/latest.json").read_text())
+            self.assertNotIn("repair.diff", latest["exports"])
+            self.assertEqual(latest["preserved_outputs"][0]["path"], str(unrelated.resolve()))
+
+    def test_unchanged_owned_custom_patch_outputs_are_cleaned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"input.diff").write_text(SAMPLE_DIFF)
+            (root/"stats.py").write_text(CURRENT)
+            code, tests = root/"custom/code.diff", root/"custom/tests.diff"
+            options = ["--patch-output", str(code), "--test-output", str(tests)]
+            self.assertEqual(self.invoke(root, DemoModel(), options), 0)
+            previous = json.loads((root/"output/latest.json").read_text())
+            self.assertTrue(code.exists())
+            self.assertTrue(tests.exists())
+            self.assertEqual(self.invoke(root, DemoModel(), [*options, "--mode", "review"]), 0)
+            self.assertFalse(code.exists())
+            self.assertFalse(tests.exists())
+            self.assertTrue((Path(previous["run_dir"])/"candidates/repair.diff").exists())
+            self.assertTrue((Path(previous["run_dir"])/"candidates/tests.diff").exists())
+
     def test_inspect_filters_exact_agent_phase_without_initializing_model(self):
         with tempfile.TemporaryDirectory() as root:
             result = run_workflow(SAMPLE_DIFF, model=ChangedModel(fail_security), run_root=Path(root)/"runs")
@@ -357,7 +502,7 @@ class ArtifactCliTests(unittest.TestCase):
             latest = json.loads((root/"output/latest.json").read_text())
             self.assertEqual(latest["status"], "proposed")
             self.assertFalse(latest["candidate_valid"])
-            self.assertFalse((root/"output/repair.diff").exists())
+            self.assertEqual((root/"output/repair.diff").read_text(), "legacy patch")
             legacy = list((root/"output/legacy").glob("*/repair.diff"))
             self.assertEqual(len(legacy), 1)
             self.assertEqual(legacy[0].read_text(), "legacy patch")

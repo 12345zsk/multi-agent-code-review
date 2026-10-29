@@ -278,7 +278,7 @@ class TaskCliTests(unittest.TestCase):
             self.assertEqual(manifest["mode"], "fix")
             self.assertEqual((root/"stats.py").read_text(), CURRENT)
 
-    def test_refusal_cli_reports_reason_with_nonzero_exit_and_no_patch(self):
+    def test_refusal_cli_reports_reason_without_publishing_or_deleting_unowned_patches(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root/"output").mkdir()
@@ -288,9 +288,12 @@ class TaskCliTests(unittest.TestCase):
             self.assertEqual(status, 2, err)
             self.assertIn("无法部署上线", out)
             self.assertTrue((root/"output/review.md").exists())
-            self.assertFalse((root/"output/repair.diff").exists())
-            self.assertFalse((root/"output/tests.diff").exists())
+            self.assertEqual((root/"output/repair.diff").read_text(), "stale patch")
+            self.assertEqual((root/"output/tests.diff").read_text(), "stale tests")
             latest = json.loads((root/"output/latest.json").read_text())
+            self.assertNotIn("repair.diff", latest["exports"])
+            self.assertNotIn("tests.diff", latest["exports"])
+            self.assertEqual(len(latest["preserved_outputs"]), 2)
             manifest = json.loads((Path(latest["run_dir"])/"manifest.json").read_text())
             self.assertEqual(manifest["status"], "unsupported")
             self.assertFalse(manifest["candidate_valid"])

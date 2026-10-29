@@ -5,9 +5,52 @@ import os
 
 from src.config import MAX_DIFF_CHARS
 from src.diff import safe_path
+from src.privacy import is_sensitive_path
 
 MAX_SEARCH_ENTRIES = 10000
 _SEARCH_SKIP = {".git", ".venv", "venv", "__pycache__", "output", "generated_tests", "logs", "node_modules", "build", "dist"}
+PROJECT_ROOT_REFERENCES = (
+    "当前项目", "整个项目", "本项目", "当前项目根目录", "项目根目录", "当前根目录",
+    "当前工作目录", "当前目录", "当前文件夹", "当前最大文件夹", "本目录", "本文件夹",
+)
+
+
+def _reference_path(reference, root):
+    if reference in PROJECT_ROOT_REFERENCES:
+        return root
+    requested = Path(reference).expanduser()
+    return requested if requested.is_absolute() else root/requested
+
+
+def _directory_prefix(target, root):
+    try:
+        relative = target.relative_to(root).as_posix()
+        if relative != ".":
+            safe_path(relative)
+    except ValueError:
+        raise ValueError("目标目录必须位于当前项目根目录之内。") from None
+    if is_sensitive_path(target.as_posix()):
+        raise ValueError("不能检索敏感目录。")
+    current = root
+    for part in Path(relative).parts:
+        current = current/part
+        if current.is_symlink():
+            raise ValueError("目标目录不能使用符号链接。")
+    return "" if relative == "." else relative.rstrip("/")+"/"
+
+
+def discover_referenced_files(references, source_root, *, run_root=None):
+    """List authorized directory contents recursively without opening target files."""
+    from src.project_tools import project_inventory
+    root = Path(source_root).resolve(strict=True)
+    prefixes = []
+    for reference in references:
+        target = _reference_path(reference, root)
+        if not target.is_dir():
+            raise ValueError("文件检索需要明确的目录或当前项目引用。")
+        prefixes.append(_directory_prefix(target, root))
+    catalog = project_inventory(root, run_root, include_all_files=True)
+    return root, {p: meta for p, meta in catalog.items() if any(p.startswith(prefix) for prefix in prefixes)}
 
 
 def explicit_reference(task: str, reference: str) -> bool:
@@ -33,7 +76,7 @@ def read_referenced_target(reference: str, source_root: str | Path, *, run_root=
         target = Path(reference).expanduser() if reference.startswith("~/") else reference
         return read_target(target, root, run_root=run_root)
     name = safe_path(reference)
-    if name.lower().startswith(".env") or Path(name).suffix.lower() in {".key", ".pem", ".p12"}:
+    if is_sensitive_path(name):
         raise ValueError("不能选择敏感文件作为代码修正目标。")
     matches = []
     visited = 0
@@ -74,13 +117,9 @@ def read_referenced_targets(references, source_root, *, run_root=None):
     root = Path(source_root).resolve(strict=True)
     sources = {}
     for reference in references:
-        requested = Path(reference).expanduser()
-        target = requested if requested.is_absolute() else root/requested
+        target = _reference_path(reference, root)
         if target.is_dir():
-            relative = target.relative_to(root).as_posix()
-            if relative != ".":
-                safe_path(relative)
-            prefix = "" if relative == "." else relative.rstrip("/")+"/"
+            prefix = _directory_prefix(target, root)
             catalog = project_inventory(root, run_root)
             paths = [p for p in catalog if p.startswith(prefix) and Path(p).suffix.lower() in
                      {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".c", ".h", ".cpp"}]
@@ -118,8 +157,7 @@ def read_target(file_path: str | Path, source_root: str | Path, *, run_root=None
     except ValueError:
         raise ValueError("Target file must stay inside source_root") from None
     parts = Path(relative).parts
-    if (any(part.lower() in {".git", ".venv", "venv", "__pycache__"} or part.lower().startswith(".env") for part in target.parts)
-            or target.suffix.lower() in {".key", ".pem", ".p12"}):
+    if is_sensitive_path(target.as_posix()):
         raise ValueError("Target path is sensitive or belongs to project internals")
     current = root
     for part in parts:

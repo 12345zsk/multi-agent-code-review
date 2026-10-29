@@ -9,7 +9,7 @@
 - [架构与各文件职责](docs/ARCHITECTURE.md)
 - [完整 Agent 节点流程图、ReAct 子循环与故障恢复](docs/ARCHITECTURE.md#实际-graph)
 - [三组分工与维护约定](docs/DEVELOPMENT.md)
-- [代表性真实模型审查样例与命令](examples/review_target.md)
+- [多文件在线测试项目、命令与独立验收](examples/ONLINE_TESTING.md)
 
 ## 安装
 
@@ -36,20 +36,22 @@ python -m examples.repair_demo
 
 ```bash
 code-review --graph --output output/workflow.mmd
-code-review --scaffold --file examples/review_target.diff
+code-review --scaffold --file examples/order_project.diff
 ```
 
 ## 命令行
 
 ```bash
-code-review "检查 examples/review_target.py，如果有错误就修正"  # 自动定位并校验、备份后直接修改原文件
-code-review "只审查 examples/review_target.py，不要修改文件"
+code-review "列出当前项目的全部文件，不进行代码审查" # 自动使用启动目录，递归列出路径和大小
+code-review "只审查当前根目录下的全部源码，不修改文件" # 自然语言选择当前项目，无需额外路径参数
+code-review --source-root examples/order_project "检查 app/ 目录，如果有错误就修正"  # 自动定位并校验、备份后直接修改原文件
+code-review --source-root examples/order_project "只审查 app/ 目录，不要修改文件"
 code-review                                  # 审查暂存区
 code-review --unstaged                       # 审查未暂存修改
 code-review --branch main                    # 审查分支相对 main 的修改
 code-review --commit abc1234                 # 审查某次提交，支持首个提交
 code-review --file patch.diff                 # 自动保存到 output/review.md
-code-review --target examples/review_target.py # 直接审查当前源码文件，无需准备 diff
+code-review --target app/service.py --source-root examples/order_project # 直接审查当前源码文件，无需准备 diff
 
 # 生成修正和测试候选；显式允许读取当前目录下的已变更文件作为上下文
 code-review --file patch.diff --mode fix --source-root .
@@ -58,11 +60,17 @@ code-review --file patch.diff --mode fix --source-root .
 code-review --file patch.diff --format json
 
 # 内置 ReAct：专家按需调用 read_source，然后输出结构化审查结果
-code-review --file examples/review_target.diff --source-root .
+code-review --file examples/order_project.diff --source-root examples/order_project
 
 # 直接写入本地修正和测试文件：先静态检查与模型回归，后备份、写入
 code-review --file patch.diff --source-root . --task "审查并修正确认的缺陷，修改本地文件。"
 ```
+
+“当前项目”“当前根目录”“整个项目”等表述直接使用程序启动时的工作目录；不自动向上寻找更大的目录。只要求列出/检索文件时，任务解析后直接递归生成文件清单，不读取目标文件正文、不调用审查专家、不修改文件。清单包含源码、配置、文档和资源文件，也可列出超过正文读取预算的大文件；敏感和隐藏路径、依赖目录、历史产物及符号链接被排除，仍受目录遍历预算限制。报告默认保存为 `output/review.md`，结构化结果中的 `project_discovery` 保存根目录及文件元数据。
+
+要求审查代码时才加载源码并进入动态专家工作流，仍限制最多 20 个源码目标和 40,000 字符输入快照。超限会明确要求缩小范围，不把目录检索成功表述为已经完成全部代码审查。
+
+空文件或仅有空白的目标没有可核实的源码证据：要求从中实现新功能时会明确返回 `unsupported`，仅审查时提示提供已有代码，不进入专家和修正流程。多文件任务中存在空的包标记文件不会阻止对其他已有实现的正常审查修正。
 
 ReAct 默认作用于动态规划、选中的专家、争议复核和失败诊断。工具包括 `list_project_files`、`search_code`、`read_source`、`analyze_python`。有 `source_root` 时可按需读取相关项目文件，首次读取固定脱敏快照；没有项目边界时只能使用提供的源码。每次 ReAct 子流程最多 8 次工具调用、10 次模型请求；模型每轮获知剩余预算，工具用完或批次超额时关闭工具，基于已有证据输出最终 JSON，保留一次格式重答且不突破总请求数。报告标记上下文收集受限，不以证据不足推断测试缺失或全面通过。每次源码读取最多 200 行、16,000 字符，累计上下文最多 120,000 字符。目录遍历、搜索和结构分析均有数量上限，截断结果不能证明不存在更多代码。工具不执行目标代码、测试或命令。
 
@@ -74,7 +82,7 @@ ReAct 默认作用于动态规划、选中的专家、争议复核和失败诊�
 
 默认结果保存在**当前工作目录**下自动创建的 `output/` 中：审查报告为 `review.md`，修正报告为 `fix-review.md`，候选代码和测试补丁为 `repair.diff`、`tests.diff`。使用 `--format json` 时报告扩展名自动改为 `.json`。未指定报告路径时仍在终端显示报告，所有写入文件的绝对路径会显示在终端。输出目录已加入本项目的 Git 忽略规则。
 
-`--output`、`--patch-output`、`--test-output` 可分别覆盖默认文件路径，父目录会自动创建。只有产生有效候选时才发布补丁；未产生有效候选的新运行会删除旧兼容补丁副本，历史产物仍保留在各自运行目录。
+`--output`、`--patch-output`、`--test-output` 可分别覆盖默认文件路径，父目录会自动创建。只有产生有效候选时才发布补丁；没有新候选时，仅清理归属及哈希均匹配上一份发布记录的旧兼容补丁。无归属或被修改的已有文件会保留并提示，不列为本次有效候选；历史产物仍保留在各自运行目录。
 
 `--source-root` 是项目边界，纯自然语言入口默认使用当前工作目录。请求可明确列出多个文件，也可给出目录路径；目录仅展开可审查源码，最多 20 个目标，仍受 diff 40,000 字符预算限制。目标引用逐字验证，不自行选择替代文件；相关上下文可以通过受限工具读取，但不会自动加入修正范围。API 的 `file_contents` 必须对应输入 diff 已应用后、修正补丁尚未应用前的版本。
 
@@ -86,7 +94,7 @@ ReAct 默认作用于动态规划、选中的专家、争议复核和失败诊�
 
 ```bash
 code-review "检查 pkg/service.py 和 pkg/storage.py 的接口调用，有错误就修正"
-code-review "审查 examples/ 目录，不要修改文件"
+code-review --source-root examples/order_project "审查 app/ 目录，不要修改文件"
 ```
 
 问题仍无法消除争议时保留 `candidate`，不会自动修正。失败诊断区分上下文不足、代码补丁、测试补丁和回归问题，并将具体指导传给下一轮；达到预算或无法安全继续时停止。相关实现与实际流程图见 [架构文档](docs/ARCHITECTURE.md)。
@@ -94,36 +102,36 @@ code-review "审查 examples/ 目录，不要修改文件"
 直接将完整自然语言作为一个命令参数，无需 `--target`、`--task`、mode 或写入开关：
 
 ```bash
-.venv/bin/python -m src.cli "检查 examples/review_target.py，如果有错误，进行修正"
+.venv/bin/python -m src.cli --source-root examples/order_project "检查 app/ 目录，如果有错误，进行修正"
 
 # 只审查，保持原文件不变
-.venv/bin/python -m src.cli "只检查 examples/review_target.py，给出问题清单，不要修改文件"
+.venv/bin/python -m src.cli --source-root examples/order_project "只检查 app/ 目录，给出问题清单，不要修改文件"
 
 # 只返回候选补丁，保持原文件不变
-.venv/bin/python -m src.cli "为 examples/review_target.py 生成修复补丁，不要修改原文件"
+.venv/bin/python -m src.cli --source-root examples/order_project "为 app/ 目录生成修复补丁，不要修改原文件"
 ```
 
-自然语言中需明确一个文件路径或文件名。相对路径以项目边界为基准；绝对路径必须位于边界内。只写文件名时，项目内必须有唯一匹配；同名、缺失、多个目标、仅给目录或目标不明时会停止并提示。查找最多检查 10,000 个目录/文件条目，跳过虚拟环境、Git、输出、日志和构建目录；超限后需给完整相对路径。模型不能凭空选文件，也不能将用户的完整路径截短为另一个文件名。
+自然语言中需明确文件名、文件路径或目录引用，支持多个目标，最多 20 个源码文件。相对路径以项目边界为基准；绝对路径必须位于边界内。只写文件名（如 `test.py`）即可从项目根目录递归查找，唯一匹配时自动读取，无需补充完整路径；重名时列出匹配路径并请用户选择，缺失或目标不明时停止并提示。查找最多检查 10,000 个目录/文件条目，跳过虚拟环境、Git、输出、日志和构建目录；超限后需给完整相对路径。模型不能凭空选文件，也不能将用户的完整路径截短为另一个文件名。
 
-修正直接写入**原文件路径**，不会生成另一个 `_fixed.py` 文件来代替修改。原始字节备份仍自动保存在运行目录，校验失败或版本发生变化时不覆盖源文件。一次纯自然语言请求目前只绑定一个源码文件；目标测试仍按已有流程生成，运行测试须在隔离环境另行完成。
+修正直接写入**原文件路径**，不会生成另一个 `_fixed.py` 文件来代替修改。原始字节备份仍自动保存在运行目录，校验失败或版本发生变化时不覆盖源文件。一次纯自然语言请求可以绑定多个源码文件或明确目录；生成测试写到源码边界下的 generated_tests/，运行测试须另行完成。
 
 也保留 `--task "..."` 的写法：没有显式 diff/Git/target 输入时，它与直接输入一句话相同，不会回退去审查不相关的暂存区变更。需要明确输入时，仍可配合 `--target`，或 `--file` / Git 输入选项：
 
 ```bash
-# 审查，明确只选择逻辑与安全两类专家
-code-review --file examples/review_target.diff --source-root . \
-  --task "请只让逻辑与安全专家审查本次变更，重点检查边界条件和 SQL 注入。"
+# 审查，给出逻辑与安全优先级，由规划器动态选择专家
+code-review --file examples/order_project.diff --source-root examples/order_project \
+  --task "审查本次变更，优先检查边界条件和 SQL 注入，按实际风险动态分工。"
 
 # 自动识别为 fix；生成候选代码与测试补丁，不写回源文件
-code-review --file examples/review_target.diff --source-root . \
+code-review --file examples/order_project.diff --source-root examples/order_project \
   --task "审查并修正确认的缺陷，保留现有接口，只生成候选补丁，不要修改本地文件。"
 
 # 自然语言自动决定写回；保留校验与备份
-code-review --file examples/review_target.diff --source-root . \
+code-review --file examples/order_project.diff --source-root examples/order_project \
   --task "审查并修正确认的缺陷，验证后写回本地文件，保留现有接口。"
 ```
 
-`task_interpreter` 先判断任务边界、目标文件/目录、审查或修正意图和写入要求。随后 `review_planner` 根据风险选择专家并分配具体问题，报告保存 `review_plan`。已移除 `--agents`；API 传入非空 `active_agents` 会明确拒绝，专业偏好只保留为任务指导，不能绕过动态分发。
+`task_interpreter` 对纯自然语言审查请求分两步处理：先提取目标引用和初步意图，由程序定位并读取文件，再携带实际源码完成任务准入及写入决策；明确越界的请求提前停止。仅列目录不需要第二次准入。指定源码入口在准入时也会提供源码。“希望代码满足某行为”可作为审查契约，不自动等于新增功能要求；一行不完整的 `import` 属于可审查的语法错误，不能仅因文件短就拒绝。明确要求开发尚不存在的新功能仍不支持。随后 `review_planner` 根据风险选择专家并分配具体问题，报告保存 `review_plan`。已移除 `--agents`；API 传入非空 `active_agents` 会明确拒绝，专业偏好只保留为任务指导，不能绕过动态分发。
 
 - **超出能力：** 返回 `unsupported` 和无法完成的原因。例如“审查并部署上线”“修复后运行目标测试”“新增登录功能”会整体拒绝，不会挑其中一部分执行。
 - **意图不清或冲突：** 返回 `needs_clarification`，说明需要明确的信息；自然语言与显式 `--mode` 冲突，或要求修改却缺少源码边界、备份目录，均停止。
@@ -133,7 +141,7 @@ code-review --file examples/review_target.diff --source-root . \
 
 Python API 使用 `run_workflow(diff, task="审查并修正确认的缺陷，只生成候选补丁", file_contents=sources)`；不必再指定 mode。结果中的 `task_intent` 保存解析结论，通过准入后的 `guidance` 使用脱敏后的用户原始指令，避免模型擅自添加审查领域或要求执行全部专家；该 guidance 会出现在报告和公共 JSON 中，独立的 `user_task` 字段仅保存在私有输入和检查点。任务解析本身是可追踪的图节点；恢复复用已经完成的解析，不重新猜测目标。`unsupported` / `needs_clarification` 运行不能直接恢复，修改请求后启动新运行。自然语言入口不能与离线 scaffold、graph、inspect 或 resume 合用。
 
-纯自然语言 API 使用 `run_task_workflow("检查 examples/review_target.py，有错误就修正", source_root=".", run_root="output/runs")`。任务解析和文件读取在可追踪的 `task_interpreter / target_resolution` 阶段内执行。源快照提交检查点后，恢复沿用原目标及源码，不再做同名查找；检查点缺失时停止，不改选当前目录中的其他文件。
+纯自然语言 API 使用 `run_task_workflow("检查 app/ 目录，有错误就修正", source_root="examples/order_project", run_root="output/runs")`。任务解析和文件读取在可追踪的 `task_interpreter / target_resolution` 阶段内执行。源快照提交检查点后，恢复沿用原目标及源码，不再做同名查找；检查点缺失时停止，不改选当前目录中的其他文件。
 
 ## 直接修改指定源码文件
 
@@ -141,14 +149,14 @@ Python API 使用 `run_workflow(diff, task="审查并修正确认的缺陷，只
 
 ```bash
 # 审查现有文件中的问题，默认不修改源文件
-code-review --target examples/review_target.py --source-root .
+code-review --target app/service.py --source-root examples/order_project
 
 # 自然语言明确要求修正并写回；也可以将路径换成自己的代码文件
-code-review --target examples/review_target.py --source-root . \
+code-review --target app/service.py --source-root examples/order_project \
   --task "检查这个文件，如果有错误，修正确认的缺陷并写回本地文件，保留原有接口。"
 
 # 只生成候选，不写回源文件
-code-review --target examples/review_target.py \
+code-review --target app/service.py --source-root examples/order_project \
   --task "检查这个文件并生成修复补丁，不要修改本地文件。"
 ```
 
@@ -166,8 +174,8 @@ Python API：
 from code_review import run_file_workflow
 
 result = run_file_workflow(
-    "examples/review_target.py",
-    source_root=".",
+    "app/service.py",
+    source_root="examples/order_project",
     task="检查并修正确认的缺陷，写回本地文件。",
     run_root="output/runs",
 )
@@ -188,7 +196,6 @@ review = run_review(diff)
 result = run_workflow(
     diff,
     mode="fix",
-    active_agents=["bug_detector", "security", "test_coverage"],
     file_contents={"src/app.py": current_source},
     max_fix_attempts=2,
 )
@@ -228,18 +235,20 @@ if patch:
 
 ## 测试与评估
 
+在线输入统一为 `examples/order_project/`。详见 [完整操作指南](examples/ONLINE_TESTING.md)：包含跨文件契约、配置、已有测试、8 类预设缺陷、正常行为、diff 对照与独立验收。`--source-root examples/order_project` 将人工答案和评分材料隔离在模型可读范围之外。
+
 `tests/` 只保存多智能体框架自身的离线测试；智能体新增的回归测试统一放在 `generated_tests/`，与框架测试分开。候选模式只在补丁中使用该路径；写回模式会创建文件，并在 Python 文件名中附加本次运行的哈希。同一次运行恢复时保持路径不变，已有快照的测试修改仍使用原路径。
 
 ```bash
 python -m unittest discover -s tests -v  # 离线：流程、解析、补丁、CLI、脱敏
-python -m evals.run_eval                # 真实模型调用：结构化发现与人工基准评估
+python -m evals.run_eval                # 真实模型调用：新订单项目的整文件与 diff 两种范围
 ```
 
 生成测试需在隔离副本中单独运行，例如 `python -m unittest discover -s generated_tests -p 'test_目标名称__run_运行哈希.py' -v`。历史测试可能针对不同版本或不同预期，不应直接合并为当前版本的验收结论；项目不会自动执行这些测试。
 
 离线测试不代表真实模型审查准确率。评估按确认状态、类别、文件和人工位置基准统计误报、漏报与定位；人工验收修正后才计算修正成功率。依赖漏洞专家不会进行联网查询，也不会凭空报告 CVE。
 
-CLI 为每次运行生成 ID，在 `output/runs/<RUN_ID>/` 保存清单、结构化结果、事件、诊断、SQLite 检查点、草稿及有效候选。`output/latest.json` 指明最新产物归属和哈希；失败或无修正的新运行不保留旧补丁副本。默认报告路径仍可使用。
+CLI 为每次运行生成 ID，在 `output/runs/<RUN_ID>/` 保存清单、结构化结果、事件、诊断、SQLite 检查点、草稿及有效候选。`output/latest.json` 指明最新产物归属和哈希；失败或无修正的新运行不会把旧补丁列为本次有效候选，无法确认归属或内容已修改的已有文件会保留并记录于 `preserved_outputs`。默认报告路径仍可使用。
 
 ```bash
 code-review --inspect <RUN_ID> --node security --phase schema_validation

@@ -79,7 +79,9 @@ class FileToolTests(unittest.TestCase):
     def test_paths_cannot_escape_or_write_sensitive_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for path in ("../outside.py", "/tmp/outside.py", ".git/config", ".Git/config", ".env", "private.pem", "output/runs/example/checkpoint.sqlite"):
+            for path in ("../outside.py", "/tmp/outside.py", ".git/config", ".Git/config", ".env", "private.pem",
+                         ".ssh/id_rsa", ".aws/credentials", ".npmrc", "keys/private.pfx",
+                         "output/runs/example/checkpoint.sqlite"):
                 with self.subTest(path=path):
                     writer = self.writer(root, sources={}, candidates={path: "safe text\n"})
                     with self.assertRaises(FileWriteError):

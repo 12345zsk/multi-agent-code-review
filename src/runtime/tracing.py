@@ -98,7 +98,7 @@ class TraceRecorder:
         with self._lock:
             item = to_data({
                 "sequence": len(self.events)+1, "event_id": uuid4().hex,
-                "run_id": self.run_id, "session_id": self.session_id, "timestamp": timestamp(),
+                "run_id": self.run_id, "execution_id": self.session_id, "timestamp": timestamp(),
                 "event": event, "node": span.node if span else "service",
                 "span_id": span.span_id if span else None, "attempt": span.attempt if span else 0,
                 "finding_ids": span.finding_ids if span else [], **metadata,
@@ -149,4 +149,4 @@ class TraceRecorder:
                           if event.get("span_id") == span_id and event.get("stage")), "execution")
             span = NodeSpan(self, started["node"], started["attempt"], span_id=span_id, finding_ids=started.get("finding_ids", []))
             self.emit("node_interrupted", span, stage=stage, error_code="PROCESS_INTERRUPTED",
-                      previous_session_id=started["session_id"])
+                      previous_execution_id=started.get("execution_id", started.get("session_id")))

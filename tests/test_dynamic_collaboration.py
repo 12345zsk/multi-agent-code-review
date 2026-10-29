@@ -33,9 +33,12 @@ class DynamicModel(DemoModel):
         payload = json.loads(messages[1].content)
         self.calls.append((role, payload))
         if role == "task_interpreter":
-            return reply({"status": "accepted", "mode": self.mode, "agents": None,
-                          "guidance": "检查并修正确认的空输入缺陷，保留正常行为。", "write_policy": "optional",
-                          "unsupported_requests": [], "reason": "明确的项目范围任务。", "target": None, "targets": self.targets})
+            data = {"status": "accepted", "mode": self.mode, "agents": None,
+                    "guidance": "检查并修正确认的空输入缺陷，保留正常行为。", "write_policy": "optional",
+                    "unsupported_requests": [], "reason": "明确的项目范围任务。"}
+            if payload["resolve_target"]:
+                data.update(target=None, targets=self.targets)
+            return reply(data)
         if role == "review_planner":
             return reply({"assignments": [{"agent_id": agent, "reason": "Visible input contract and caller risk.",
                                             "questions": ["Does the empty-list contract hold for the visible caller?"]}

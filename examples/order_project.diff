@@ -1,0 +1,22 @@
+--- a/app/pricing.py
++++ b/app/pricing.py
+@@ -10,4 +10,4 @@
+     if unit_price_cents < 0 or quantity < 1 or not 0 <= discount_percent <= 100:
+         raise ValueError("Invalid price, quantity or discount")
+     gross = unit_price_cents * quantity
+-    return (gross * (100 - discount_percent) + 50) // 100
++    return gross - discount_percent
+--- a/app/repository.py
++++ b/app/repository.py
+@@ -11,9 +11,9 @@
+     """Return an exact order in this tenant, or None. Return named columns."""
+     query = (
+         "SELECT id, tenant_id, total_cents, status FROM orders "
+-        "WHERE tenant_id = ? AND id = ?"
++        "WHERE tenant_id = ? AND id = '" + order_id + "'"
+     )
+-    row = connection.execute(query, (tenant_id, order_id)).fetchone()
++    row = connection.execute(query, (tenant_id,)).fetchone()
+     return dict(row) if row is not None else None
+ 
+ 

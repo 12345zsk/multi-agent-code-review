@@ -73,7 +73,8 @@ def _route_reviews(state: WorkflowState) -> list[str]:
 
 
 def _route_task(state: WorkflowState) -> str:
-    if _blocked(state) or state.get("task_intent", {}).get("status") in {"unsupported", "needs_clarification"}:
+    if (_blocked(state) or state.get("task_intent", {}).get("status") in {"unsupported", "needs_clarification"}
+            or state.get("project_discovery") is not None):
         return "reporter"
     return "context_collector"
 

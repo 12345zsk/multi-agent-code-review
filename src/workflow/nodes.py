@@ -54,6 +54,15 @@ def reporter_node(state: WorkflowState) -> dict:
     from src.privacy import redact
 
     intent = state.get("task_intent", {})
+    if intent.get("status") == "accepted" and intent.get("operation") == "discover" and state.get("project_discovery") is not None:
+        discovery = state["project_discovery"]
+        files = discovery["files"]
+        lines = ["# 项目文件检索", "Status: completed", "Run ID: " + state.get("run_id", "untracked"),
+                 "项目根目录：" + discovery["root"], "发现文件：" + str(len(files)), "",
+                 "递归列出允许检索的项目文件，不读取文件内容，不执行代码审查或文件写入。",
+                 "已排除隐藏和敏感路径、依赖目录、历史产物及符号链接；目录遍历预算超限时停止并提示。", ""]
+        lines.extend("- " + path + " (" + str(meta["size"]) + " bytes)" for path, meta in files.items())
+        return {"status": "completed", "final_review": redact("\n".join(lines))}
     if intent.get("status") in {"unsupported", "needs_clarification"}:
         title = "无法完成该任务" if intent["status"] == "unsupported" else "需要澄清任务"
         lines = ["# " + title, "Status: " + intent["status"],
@@ -95,11 +104,13 @@ def reporter_node(state: WorkflowState) -> dict:
     uncertain = [f for f in findings if f.status == "candidate"]
     limited_roles = sorted({event["node"] for event in state.get("trace_events", [])
                             if event["event"] == "react_finalization"})
+    scope_limited_roles = sorted({event["node"] for event in state.get("trace_events", [])
+                                 if event["event"] == "finding_scope_rejected"})
     if status in {"failed", "incomplete"} or uncertain:
         verdict = "NEEDS DISCUSSION"
     elif any(f.severity in {"critical", "high", "medium"} for f in confirmed):
         verdict = "REQUEST CHANGES"
-    elif limited_roles:
+    elif limited_roles or scope_limited_roles:
         verdict = "NEEDS DISCUSSION"
     else:
         verdict = "APPROVE"
@@ -130,6 +141,9 @@ def reporter_node(state: WorkflowState) -> dict:
         lines.extend(["", "Context collection limited by the ReAct budget: " + ", ".join(limited_roles) + ".",
                       "Results use collected evidence only; unverified questions remain uncertain. "
                       "This does not establish complete review or test coverage."])
+    if scope_limited_roles:
+        lines.extend(["", "Out-of-scope findings remained after one correction request and were excluded: "
+                      + ", ".join(scope_limited_roles) + ". This does not establish a clean review."])
     if state.get("review_plan"):
         lines.extend(["", "## Dynamic review plan"])
         for assignment in state["review_plan"]:

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "case_id": "order_project_diff",
+  "line_tolerance": 2,
+  "expected": [
+    {
+      "id": "percentage_discount",
+      "category": "other",
+      "file_path": "app/pricing.py",
+      "line_start": 13,
+      "line_end": 13
+    },
+    {
+      "id": "literal_order_id",
+      "category": "security.sql_injection",
+      "file_path": "app/repository.py",
+      "line_start": 14,
+      "line_end": 14
+    }
+  ],
+  "source_hashes": {
+    "app/pricing.py": "52bd9195e5a6b6e352e6843a8c06ea283eda80b72b40ad5297e85a7fb3dd0e1a",
+    "app/repository.py": "5390ec33db49708c9497608029315e7c2e32188dca96a9c32bf6763827a62484"
+  }
+}

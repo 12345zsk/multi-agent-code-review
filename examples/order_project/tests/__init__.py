@@ -1,0 +1,1 @@
+"""Existing application smoke tests."""

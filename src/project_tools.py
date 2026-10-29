@@ -11,7 +11,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.diff import parse_diff, safe_path, validate_source_context
-from src.privacy import redact
+from src.privacy import is_sensitive_path, redact
 from src.source_input import read_target, _SEARCH_SKIP
 
 MAX_PROJECT_ENTRIES = 2000
@@ -22,11 +22,12 @@ TEXT_SUFFIXES = {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".c
 
 def eligible(path):
     parts = Path(path).parts
-    return (not any(part.startswith(".") or part.lower() in _SEARCH_SKIP for part in parts)
+    return (not is_sensitive_path(path)
+            and not any(part.startswith(".") or part.lower() in _SEARCH_SKIP for part in parts)
             and Path(path).suffix.lower() in TEXT_SUFFIXES)
 
 
-def project_inventory(root, run_root=None):
+def project_inventory(root, run_root=None, *, include_all_files=False):
     if not root:
         return {}
     root = Path(root).resolve(strict=True)
@@ -42,10 +43,12 @@ def project_inventory(root, run_root=None):
         for name in sorted(files):
             path = Path(current)/name
             relative = path.relative_to(root).as_posix()
-            if len(relative) > 500 or not eligible(relative) or path.is_symlink() or path.resolve().is_relative_to(history):
+            permitted = (not is_sensitive_path(relative) and not any(part.startswith(".") for part in Path(relative).parts)
+                         if include_all_files else eligible(relative))
+            if len(relative) > 500 or not permitted or path.is_symlink() or path.resolve().is_relative_to(history):
                 continue
             stat = path.stat()
-            if stat.st_size <= 160000:
+            if include_all_files or stat.st_size <= 160000:
                 result[relative] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
     return result
 
@@ -72,7 +75,7 @@ class ProjectContext:
 
     def read(self, path):
         path = safe_path(path)
-        if any(part.startswith(".") for part in Path(path).parts) or Path(path).suffix.lower() in {".key", ".pem", ".p12"}:
+        if is_sensitive_path(path) or any(part.startswith(".") for part in Path(path).parts):
             raise ValueError("SOURCE_NOT_AVAILABLE")
         if path in self.sources:
             return self.sources[path]

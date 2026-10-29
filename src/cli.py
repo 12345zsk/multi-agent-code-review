@@ -9,7 +9,7 @@ import sys
 
 from src.config import MAX_DIFF_CHARS
 from src.diff import parse_diff
-from src.privacy import redact
+from src.privacy import is_sensitive_path, redact
 from src.serialization import to_json
 
 
@@ -62,7 +62,7 @@ def _read_sources(paths: list[str], root: str | None) -> dict[str, str]:
         path = (base / relative).resolve()
         if not path.is_relative_to(base):
             raise ValueError("Source path escapes --source-root")
-        if path.name.startswith(".env") or path.suffix in {".key", ".pem", ".p12"}:
+        if is_sensitive_path(path.as_posix()):
             continue
         if not path.is_file():
             continue
@@ -215,6 +215,8 @@ def main() -> None:
         for name in ("repair.diff", "tests.diff"):
             if name in latest["exports"]:
                 print("Saved: " + redact(latest["exports"][name]["path"]), file=sys.stderr)
+        for item in latest.get("preserved_outputs", []):
+            print("Preserved existing file (not a current candidate): " + redact(item["path"]), file=sys.stderr)
         if result["status"] in {"unsupported", "needs_clarification"}:
             raise SystemExit(2)
         if not args.scaffold and result["status"] in {"failed", "incomplete"}:

@@ -88,6 +88,8 @@ class RunStore:
             "mode": inputs["mode"], "scaffold": inputs.get("scaffold", False), "resumes": 0,
             "review_scope": inputs.get("review_scope", "diff"),
             "target_file": inputs.get("target_file"),
+            # Path protection is independent of permission to discover/read files.
+            "source_base": inputs.get("source_root") or str(Path.cwd().resolve()),
             "artifacts": {},
         }
         write_json(store.path/"input.json", inputs)
@@ -191,6 +193,7 @@ class RunStore:
             artifacts[relative] = {"path": relative, "classification": "private_context_snapshot",
                                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
         self.metadata.update(status=state["status"], mode=state["mode"], target_file=state.get("target_file") or self.metadata.get("target_file"),
+                             source_base=state.get("source_root") or self.metadata.get("source_base"),
                              target_files=state.get("target_files", []), active_agents=state.get("active_agents", []),
                              workflow_version=state.get("workflow_version"), context_hashes=state.get("context_hashes", {}),
                              finished_at=timestamp(), model_name=state.get("model_name", "unknown"),
@@ -210,6 +213,9 @@ def publish_run(store, *, report_path, patch_path, test_path, output_root="outpu
     if any(path.is_relative_to(store.path.parent) for path in targets):
         raise ValueError("Compatibility outputs must stay outside the private run history")
     root = Path(output_root)
+    reserved = {(root/name).resolve() for name in ("latest.json", "latest-review.json", "latest-fix.json", ".publish.lock")}
+    if set(targets) & reserved:
+        raise ValueError("Output paths must not use reserved publication indexes or lock files")
     with file_lock(store.path/".run.lock"), file_lock(root/".publish.lock", blocking=True):
         current = json.loads((store.path/"manifest.json").read_text())
         if current.get("target_file") and Path(current["target_file"]).resolve() in targets:
@@ -220,8 +226,12 @@ def publish_run(store, *, report_path, patch_path, test_path, output_root="outpu
             protected = {(Path(current["write_root"])/path).resolve() for path in current.get("write_paths", [])}
             if set(targets) & protected:
                 raise ValueError("Output paths must not overwrite repair targets; inspect run " + store.run_id)
+        source_base = current.get("source_base") or store.read_inputs().get("source_root") or str(Path.cwd().resolve())
+        source_paths = set(current.get("write_paths", [])) | set(current.get("context_hashes", {}))
+        if {(Path(source_base)/path).resolve() for path in source_paths} & set(targets):
+            raise ValueError("Output paths must not overwrite reviewed source or context files; inspect run " + store.run_id)
         if (current.get("completion_id") != store.metadata.get("completion_id")
-                or current.get("session_id") != current.get("completion_id")):
+                or current.get("execution_id", current.get("session_id")) != current.get("completion_id")):
             raise ValueError("Run changed before publication; inspect the latest run manifest")
         report_name = "result.json" if report_format == "json" else "fix-review.md" if store.metadata["mode"] == "fix" else "review.md"
         buffers = {}
@@ -238,22 +248,48 @@ def publish_run(store, *, report_path, patch_path, test_path, output_root="outpu
             if filename.endswith(".diff") and (not store.metadata["candidate_valid"] or artifact["classification"] != "validated_candidate"):
                 raise ValueError("A draft cannot be published as a validated candidate")
             buffers[filename] = content.decode("utf-8")
+        try:
+            previous = json.loads((root/"latest.json").read_text())
+        except (OSError, ValueError):
+            previous = {}
         _archive_legacy(root)
         atomic_write(targets[0], buffers[report_name])
         exports = {"report": {"path": str(targets[0]), "sha256": store.metadata["artifacts"][report_name]["sha256"], "run_id": store.run_id}}
+        preserved = []
         for target, filename in zip(targets[1:], ("repair.diff", "tests.diff")):
             if filename in buffers:
                 atomic_write(target, buffers[filename])
                 exports[filename] = {"path": str(target), "sha256": store.metadata["artifacts"][filename]["sha256"], "run_id": store.run_id}
-            else:
+            elif _owned_patch_output(target, filename, previous):
                 target.unlink(missing_ok=True)
+            elif target.exists() or target.is_symlink():
+                preserved.append({"path": str(target), "reason": "ownership_or_content_unverified"})
         latest = {"schema_version": 1, "run_id": store.run_id, "mode": store.metadata["mode"],
                   "status": store.metadata["status"], "run_dir": str(store.path),
                   "write_status": store.metadata.get("write_status", "not_run"),
                   "candidate_valid": store.metadata["candidate_valid"], "exports": exports}
+        if preserved:
+            latest["preserved_outputs"] = preserved
         write_json(root/("latest-"+store.metadata["mode"]+".json"), {key: latest[key] for key in ("run_id", "mode", "status", "run_dir", "candidate_valid")})
         write_json(root/"latest.json", latest)
     return latest
+
+
+def _owned_patch_output(target, filename, previous):
+    """Only unchanged candidates at their recorded published path can be removed."""
+    if (not isinstance(previous, dict) or previous.get("schema_version") != 1
+            or previous.get("candidate_valid") is not True or not isinstance(previous.get("run_id"), str)
+            or not isinstance(previous.get("exports"), dict)):
+        return False
+    artifact = previous["exports"].get(filename)
+    if (not isinstance(artifact, dict) or artifact.get("path") != str(target)
+            or artifact.get("run_id") != previous["run_id"]):
+        return False
+    try:
+        return (not target.is_symlink() and target.is_file()
+                and hashlib.sha256(target.read_bytes()).hexdigest() == artifact.get("sha256"))
+    except OSError:
+        return False
 
 
 def _archive_legacy(root):

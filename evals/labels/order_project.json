@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "case_id": "order_project",
+  "line_tolerance": 2,
+  "expected": [
+    {
+      "id": "percentage_discount",
+      "category": "other",
+      "file_path": "app/pricing.py",
+      "line_start": 13,
+      "line_end": 13
+    },
+    {
+      "id": "empty_average",
+      "category": "correctness.empty_input",
+      "file_path": "app/service.py",
+      "line_start": 13,
+      "line_end": 13
+    },
+    {
+      "id": "one_based_page",
+      "category": "correctness.pagination",
+      "file_path": "app/service.py",
+      "line_start": 38,
+      "line_end": 38
+    },
+    {
+      "id": "summary_schema",
+      "category": "compatibility",
+      "file_path": "app/service.py",
+      "line_start": 20,
+      "line_end": 20
+    },
+    {
+      "id": "literal_order_id",
+      "category": "security.sql_injection",
+      "file_path": "app/repository.py",
+      "line_start": 14,
+      "line_end": 14
+    },
+    {
+      "id": "tenant_cancellation",
+      "category": "security.authorization",
+      "file_path": "app/repository.py",
+      "line_start": 23,
+      "line_end": 23
+    },
+    {
+      "id": "bounded_page_queries",
+      "category": "performance",
+      "file_path": "app/service.py",
+      "line_start": 40,
+      "line_end": 40
+    },
+    {
+      "id": "status_syntax",
+      "category": "other",
+      "file_path": "app/formatting.py",
+      "line_start": 4,
+      "line_end": 4
+    }
+  ],
+  "source_hashes": {
+    "app/__init__.py": "ee71c7426d6b2efec5131a9fbe8b57b8aa9f3c2a39e085361888aa2d493d5fe7",
+    "app/checkout.py": "c593a461e809d240589b405eef7af60dfe40e61e69f1ab183740106350352e57",
+    "app/formatting.py": "1771c3d8106d7da1418124ad47b83edeae4ca7d226dc177e4179797b5de26613",
+    "app/pricing.py": "52bd9195e5a6b6e352e6843a8c06ea283eda80b72b40ad5297e85a7fb3dd0e1a",
+    "app/repository.py": "5390ec33db49708c9497608029315e7c2e32188dca96a9c32bf6763827a62484",
+    "app/service.py": "43e117448b4333d6e6107c4154e529b63e08b38690d124b82650ee1e1e6a42ef"
+  }
+}

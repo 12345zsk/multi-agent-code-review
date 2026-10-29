@@ -106,6 +106,7 @@ class WorkflowState(TypedDict, total=False):
     active_agents: list[str]
     review_plan: list[dict]
     project_inventory: dict
+    project_discovery: dict
     observed_sources: Annotated[dict[str, dict[str, str]], operator.or_]
     review_disputes: list[dict]
     dispute_reviews: list[dict]

@@ -108,6 +108,50 @@ class CliTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _read_sources(["escape.py"], str(root))
 
+    def test_readonly_diff_exports_cannot_overwrite_or_delete_source(self):
+        for flag in ("--output", "--patch-output", "--test-output"):
+            for supply_root in (False, True):
+                with self.subTest(flag=flag, source_root=supply_root), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root/"stats.py").write_text(CURRENT)
+                    (root/"input.diff").write_text(SAMPLE_DIFF)
+                    args = ["--file", str(root/"input.diff"), flag, "stats.py"]
+                    if supply_root:
+                        args.extend(["--source-root", str(root)])
+                    with patch("src.llm.get_fast_llm", return_value=DemoModel()):
+                        code, _, error = self.invoke(args)
+                    self.assertEqual(code, 2, error)
+                    self.assertEqual((root/"stats.py").read_text(), CURRENT)
+                    self.assertFalse((root/"output/latest.json").exists())
+
+    def test_diff_source_loader_skips_sensitive_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/".ssh").mkdir()
+            (root/".ssh/id_rsa").write_text("SYNTHETIC_PRIVATE_FILE")
+            (root/"stats.py").write_text(CURRENT)
+            self.assertEqual(_read_sources([".ssh/id_rsa", "stats.py"], str(root)), {"stats.py": CURRENT})
+
+    def test_missing_patch_preserves_unowned_custom_output_files(self):
+        for flag in ("--patch-output", "--test-output"):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root/"stats.py").write_text(CURRENT)
+                (root/"input.diff").write_text(SAMPLE_DIFF)
+                unrelated = root/"unrelated_module.py"
+                content = "def untouched():\n    return 42\n"
+                unrelated.write_text(content)
+                with patch("src.llm.get_fast_llm", return_value=DemoModel()):
+                    code, _, error = self.invoke(["--file", str(root/"input.diff"), "--source-root", str(root),
+                                                  flag, str(unrelated)])
+                self.assertEqual(code, 0, error)
+                self.assertEqual(unrelated.read_text(), content)
+                self.assertIn("Preserved existing file", error)
+                latest = json.loads((root/"output/latest.json").read_text())
+                self.assertEqual(latest["preserved_outputs"][0]["path"], str(unrelated.resolve()))
+                self.assertNotIn("repair.diff", latest["exports"])
+                self.assertNotIn("tests.diff", latest["exports"])
+
     def test_mismatched_source_fails_before_model_or_output_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -7,7 +7,7 @@ from src.contracts import AgentReport, AgentSpec, Finding, NodeHandler, Workflow
 from src.diff import parse_diff, safe_path
 from src.model_agent import ModelOutputError, invoke_json
 from src.review.evidence import locate_evidence, supplied_evidence
-from src.runtime.tracing import trace_stage
+from src.runtime.tracing import trace_detail, trace_stage
 from src.schemas import AdjudicationReply, DisputeReply, ReviewReply
 from src.project_tools import available_sources, react_options
 from src.task_intent import task_context
@@ -54,6 +54,20 @@ def _unverified_coverage(finding):
     )
 
 
+def _partition_finding_scope(items, allowed_paths):
+    valid, rejected = [], []
+    for item in items:
+        try:
+            path = safe_path(item.file_path)
+        except ValueError:
+            path = None
+        if path not in allowed_paths:
+            rejected.append(item)
+        else:
+            valid.append((item, path))
+    return valid, rejected
+
+
 def make_specialist_node(spec: AgentSpec, model, *, react=True) -> NodeHandler:
     def review_node(state: WorkflowState) -> dict:
         whole_file = state.get("review_scope") == "file"
@@ -71,8 +85,7 @@ def make_specialist_node(spec: AgentSpec, model, *, react=True) -> NodeHandler:
             invoke, options = invoke_react_json, react_options(state, observed, tool_observations=observations)
             payload["available_sources"] = {path: {"total_lines": len(source.splitlines())}
                                             for path, source in options["sources"].items()}
-        reply = invoke(
-            model, spec.id,
+        instructions = (
             f"You review {spec.responsibility}. {_FOCUS[spec.id]} "
             + ("Review actionable existing defects in the complete current file, including syntax errors. "
                "The context-only diff encodes an existing file snapshot, not a change or a new file. "
@@ -86,15 +99,36 @@ def make_specialist_node(spec: AgentSpec, model, *, react=True) -> NodeHandler:
             "Do not claim repository-wide absence of tests from this limited context. "
             "Use critical only with demonstrated severe impact AND exposure; a vulnerability category alone is insufficient. "
             "Set category to the most specific schema category; use other only when no defined category fits. "
-            + _CLAIM_GUIDANCE,
-            payload, ReviewReply, **options,
+            + _CLAIM_GUIDANCE
         )
+        reply = invoke(model, spec.id, instructions, payload, ReviewReply, **options)
+        allowed_paths = changes.keys() & set(state["file_paths"])
+        scoped_items, rejected = _partition_finding_scope(reply.findings, allowed_paths)
+        if rejected:
+            # Keep valid candidates; retry only the scope mistakes without opening
+            # another ReAct/tool budget or reusing its completed child checkpoint.
+            trace_detail("finding_scope_retry", stage="finding_scope", error_code="FINDING_PATH_INVALID",
+                         rejected_count=len(rejected), scope_attempt=1)
+            correction = invoke_json(
+                model, spec.id, instructions +
+                " Correct only the supplied out_of_scope_findings. Findings outside allowed_file_paths "
+                "cannot be reported, including existing tests read as context. Omit context-only observations. "
+                "Return a replacement only if an actual defect in an allowed file has exact evidence there; "
+                "do not merely rename its path. Valid findings from the first answer are already retained. "
+                "New regression tests are handled later by test_generator. Use collected evidence only; no tools.",
+                {**payload, "sources": {**available_sources(state), **observed},
+                 "scope_feedback": {"code": "FINDING_PATH_INVALID", "allowed_file_paths": sorted(allowed_paths)},
+                 "out_of_scope_findings": [item.model_dump() for item in rejected]}, ReviewReply,
+            )
+            corrected, rejected = _partition_finding_scope(correction.findings, allowed_paths)
+            scoped_items.extend(corrected)
+            if rejected:
+                # Never echo untrusted paths or model text into public trace metadata.
+                trace_detail("finding_scope_rejected", stage="finding_scope", error_code="FINDING_PATH_INVALID",
+                             rejected_count=len(rejected), scope_attempt=1)
         findings = []
         seen = set()
-        for item in reply.findings:
-            path = safe_path(item.file_path)
-            if path not in changes:
-                raise ModelOutputError("Finding references an unchanged file", code="FINDING_PATH_INVALID", stage="finding_evidence")
+        for item, path in scoped_items:
             with trace_stage("finding_evidence", file_path=path):
                 line = locate_evidence(changes[path], state.get("file_contents", {}).get(path), item.evidence, item.line)
             fingerprint = f"{spec.id}|{path}|{line}|{item.title.strip().casefold()}"
@@ -108,6 +142,8 @@ def make_specialist_node(spec: AgentSpec, model, *, react=True) -> NodeHandler:
         # Free-form model summaries have no per-claim evidence contract.
         scope = "complete supplied file" if whole_file else "supplied diff/source only"
         summary = f"{len(findings)} candidate finding(s). Scope: {scope}; no repository-wide test or runtime checks."
+        if rejected:
+            summary += f" {len(rejected)} out-of-scope finding(s) excluded after one correction request."
         return {"reports": {spec.id: AgentReport(spec.id, "completed", tuple(findings), summary, tuple(observations))},
                 "observed_sources": {spec.id: observed}}
 

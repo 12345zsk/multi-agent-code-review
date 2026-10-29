@@ -231,10 +231,10 @@ def _execute(inputs, store, *, model=None, handlers=None, resume=False, allow_co
         tracer = TraceRecorder(run_id, store)
         if store:
             store.session_id = tracer.session_id
-            store.metadata["session_id"] = tracer.session_id
+            store.metadata["execution_id"] = tracer.session_id
             store.metadata["dependencies"] = {name: version(name) for name in (
                 "langgraph", "langgraph-checkpoint", "langgraph-checkpoint-sqlite", "langchain-core", "langchain-deepseek", "pydantic", "python-dotenv")}
-            store.metadata.setdefault("sessions", []).append({"session_id": tracer.session_id,
+            store.metadata.setdefault("sessions", []).append({"execution_id": tracer.session_id,
                 "model_name": "initializing", "code_hash": store.metadata["code_hash"],
                 "dependencies": store.metadata["dependencies"], "pid": os.getpid()})
             store.save_metadata()
@@ -314,12 +314,14 @@ def _execute(inputs, store, *, model=None, handlers=None, resume=False, allow_co
                                 exception_type=type(checkpoint_error).__name__, locations=locations(checkpoint_error))
             node = exc.node if isinstance(exc, NodeExecutionError) else "model_initialization" if not initialized else "service"
             code = getattr(exc, "code", "RUN_EXECUTION_FAILED") if type(exc).__module__.startswith("src.") else "RUN_INTERRUPTED" if isinstance(exc, KeyboardInterrupt) else "RUN_EXECUTION_FAILED"
-            if not tracer.diagnostics() or tracer.diagnostics()[-1]["node"] != node:
+            if not any(item["node"] == node and not item["resolved"] for item in tracer.diagnostics()):
                 tracer.emit("node_failed", node=node, stage="initialization" if not initialized else "workflow",
                             error_code=code, exception_type=type(exc).__name__, locations=locations(exc))
-            state["errors"] = [f"{node}: {code}; inspect diagnostics.json and events.jsonl"]
-            if node in AGENT_IDS:
-                state["reports"] = {**state.get("reports", {}), node: AgentReport(node, "failed")}
+            failures = {item["node"]: item["error_code"] for item in tracer.diagnostics() if not item["resolved"]}
+            state["errors"] = [f"{name}: {failure}; inspect diagnostics.json and events.jsonl"
+                               for name, failure in sorted(failures.items())]
+            state["reports"] = {**state.get("reports", {}),
+                                **{name: AgentReport(name, "failed") for name in failures if name in AGENT_IDS}}
             if state.get("write_root"):
                 from src.file_tools import read_write_result
                 state["write_result"] = read_write_result(state["write_root"], store.path, state.get("candidate_files", {}))

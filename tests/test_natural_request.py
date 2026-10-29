@@ -14,7 +14,7 @@ from code_review import run_task_workflow
 from examples.repair_demo import BEFORE, CURRENT, DemoModel, unified
 from src.cli import main
 from src.source_input import explicit_reference
-from src.workflow.service import resume_workflow
+from src.workflow.service import resume_workflow, run_file_workflow
 
 
 class RequestModel(DemoModel):
@@ -28,18 +28,20 @@ class RequestModel(DemoModel):
         payload = json.loads(messages[1].content)
         self.calls.append((role, payload))
         if role == "task_interpreter":
-            assert payload["resolve_target"]
-            assert payload["file_paths"] == []
+            if payload["resolve_target"]:
+                assert payload["file_paths"] == []
             admitted = self.outcome == "accepted"
-            return AIMessage(content=json.dumps({
+            data = {
                 "status": self.outcome, "mode": self.mode if admitted else None,
                 "agents": None,
                 "guidance": "检查指定源码，遵守空输入返回零的契约。" if admitted else None,
                 "write_policy": self.policy if admitted else None,
-                "target": self.target if admitted else None,
                 "unsupported_requests": ["部署上线"] if self.outcome == "unsupported" else [],
                 "reason": "明确的单文件任务。" if admitted else "无法执行，请明确一个支持的单文件审查或修正目标。",
-            }, ensure_ascii=False))
+            }
+            if payload["resolve_target"]:
+                data["target"] = self.target if admitted else None
+            return AIMessage(content=json.dumps(data, ensure_ascii=False))
         if role == "bug_detector":
             self.path = payload["file_paths"][0]
         data = json.loads(super().invoke(messages).content)
@@ -52,9 +54,262 @@ class RequestModel(DemoModel):
         return AIMessage(content=json.dumps(data))
 
 
+class ListingModel(RequestModel):
+    def invoke(self, messages):
+        if not messages[0].content.startswith("ROLE: task_interpreter\n"):
+            raise AssertionError("File listing must not invoke review agents")
+        reply = json.loads(super().invoke(messages).content)
+        reply["operation"] = "discover"
+        return AIMessage(content=json.dumps(reply))
+
+
+class EmptyAdmissionModel(DemoModel):
+    def __init__(self, mode):
+        self.mode, self.calls = mode, []
+
+    def invoke(self, messages):
+        role = messages[0].content.splitlines()[0].removeprefix("ROLE: ")
+        self.calls.append(role)
+        if role != "task_interpreter":
+            raise AssertionError("Empty targets must stop before review planning")
+        payload = json.loads(messages[1].content)
+        data = {"status": "accepted", "mode": self.mode, "agents": None,
+                "guidance": "检查指定文件。", "write_policy": "required" if self.mode == "fix" else "forbidden",
+                "unsupported_requests": [], "reason": "Synthetic mistaken admission of an empty target."}
+        if payload.get("resolve_target"):
+            data.update(target=None, targets=["test.py"])
+        return AIMessage(content=json.dumps(data))
+
+
 class NaturalRequestTests(unittest.TestCase):
     def execute(self, root, model, task):
         return run_task_workflow(task, source_root=root, run_root=root/"runs", model=model)
+
+    def test_basename_and_desired_contract_are_admitted_against_actual_source(self):
+        class SourceAwareModel(DemoModel):
+            def __init__(self):
+                self.admissions = []
+
+            def invoke(self, messages):
+                role = messages[0].content.splitlines()[0].removeprefix("ROLE: ")
+                payload = json.loads(messages[1].content)
+                if role == "task_interpreter":
+                    self.admissions.append(payload)
+                    data = {"status": "accepted", "mode": "review", "agents": None,
+                            "guidance": payload["user_task"], "write_policy": "forbidden",
+                            "unsupported_requests": [], "reason": "审查已有源码中的语法错误及预期契约。"}
+                    if payload["resolve_target"]:
+                        data.update(target=None, targets=["test.py"])
+                    elif payload.get("file_contents") != {"nested/test.py": "import\n"}:
+                        raise AssertionError("Admission must see the real resolved source")
+                    return AIMessage(content=json.dumps(data))
+                if role == "review_planner":
+                    data = {"assignments": [{"agent_id": "bug_detector", "reason": "Incomplete import is invalid Python.",
+                                             "questions": ["Check the existing import syntax without inventing new functionality."]}]}
+                elif role == "bug_detector":
+                    data = {"summary": "Existing syntax defect.", "findings": [{
+                        "category": "other", "title": "Incomplete import", "description": "The import statement has no module name.",
+                        "file_path": "nested/test.py", "line": 1, "severity": "high", "fixable": False,
+                        "suggestion": "Clarify the intended import; do not invent an addition processor.", "evidence": "import",
+                    }]}
+                else:
+                    return super().invoke(messages)
+                return AIMessage(content=json.dumps(data))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"nested").mkdir()
+            target = root/"nested/test.py"
+            target.write_text("import\n")
+            model = SourceAwareModel()
+            result = self.execute(root, model, "检查test.py，我希望是一个加法处理器，并包含一定安全边界检测功能")
+            self.assertEqual(result["status"], "completed", result["errors"])
+            self.assertEqual(len(model.admissions), 2)
+            self.assertEqual(model.admissions[1]["file_contents"], {"nested/test.py": "import\n"})
+            self.assertEqual(result["file_paths"], ["nested/test.py"])
+            self.assertEqual(result["findings"][0].line, 1)
+            self.assertEqual(target.read_text(), "import\n")
+            self.assertEqual(result["write_result"]["status"], "not_run")
+
+    def test_source_admission_can_reject_actual_feature_development(self):
+        class FeatureModel(RequestModel):
+            def invoke(self, messages):
+                payload = json.loads(messages[1].content)
+                if messages[0].content.startswith("ROLE: task_interpreter\n") and not payload["resolve_target"]:
+                    return AIMessage(content=json.dumps({
+                        "status": "unsupported", "mode": None, "agents": None, "guidance": None,
+                        "write_policy": None, "unsupported_requests": ["新建登录功能"],
+                        "reason": "现有统计模块不包含登录功能，新增登录功能超出缺陷修正范围。",
+                    }))
+                return super().invoke(messages)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"stats.py").write_text(CURRENT)
+            result = self.execute(root, FeatureModel(), "检查 stats.py 并新增一个登录功能。")
+            self.assertEqual(result["status"], "unsupported")
+            self.assertEqual(result["reports"], {})
+            self.assertEqual(result["fix_attempts"], 0)
+            self.assertIsNone(result["write_root"])
+            self.assertEqual((root/"stats.py").read_text(), CURRENT)
+
+    def test_source_admission_controls_write_permission_and_mode(self):
+        class ReadOnlyAdmission(RequestModel):
+            def invoke(self, messages):
+                response = super().invoke(messages)
+                if (messages[0].content.startswith("ROLE: task_interpreter\n")
+                        and not json.loads(messages[1].content)["resolve_target"]):
+                    data = json.loads(response.content)
+                    data.update(mode="review", write_policy="forbidden")
+                    return AIMessage(content=json.dumps(data))
+                return response
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"stats.py").write_text(CURRENT)
+            result = self.execute(root, ReadOnlyAdmission(), "只检查 stats.py，不修改文件。")
+            self.assertEqual(result["status"], "completed", result["errors"])
+            self.assertEqual(result["mode"], "review")
+            self.assertIsNone(result["write_root"])
+            self.assertEqual(result["write_result"]["status"], "not_run")
+            self.assertEqual((root/"stats.py").read_text(), CURRENT)
+            self.assertNotIn("patch", result)
+
+    def test_empty_or_whitespace_repair_stops_before_specialists_and_writing(self):
+        for content in ("", " \n\t\n"):
+            for standalone in (True, False):
+                with self.subTest(content=repr(content), standalone=standalone), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    target = root/"test.py"
+                    target.write_text(content)
+                    model = EmptyAdmissionModel("fix")
+                    task = "检查test.py，我希望是一个加法处理器，并包含一定安全边界检测功能"
+                    if standalone:
+                        result = self.execute(root, model, task)
+                    else:
+                        result = run_file_workflow("test.py", source_root=root, run_root=root/"runs", task=task, model=model)
+                    self.assertEqual(result["status"], "unsupported")
+                    self.assertEqual(model.calls, ["task_interpreter"])
+                    self.assertEqual(result["reports"], {})
+                    self.assertEqual(result["fix_attempts"], 0)
+                    self.assertEqual(result["write_result"]["status"], "not_run")
+                    self.assertIsNone(result["write_root"])
+                    self.assertEqual(target.read_text(), content)
+                    self.assertIn("空", result["final_review"])
+                    self.assertIn("新功能", result["final_review"])
+                    self.assertFalse((Path(result["run_dir"])/"writes").exists())
+
+    def test_empty_readonly_review_requests_implementation_instead_of_inventing_findings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"test.py").write_text("")
+            model = EmptyAdmissionModel("review")
+            result = self.execute(root, model, "只检查 test.py 中的已有错误，不要修改。")
+            self.assertEqual(result["status"], "needs_clarification")
+            self.assertEqual(model.calls, ["task_interpreter"])
+            self.assertEqual(result["reports"], {})
+            self.assertIn("空", result["final_review"])
+
+    def test_an_empty_package_marker_does_not_block_repair_of_existing_code(self):
+        class MixedModel(RequestModel):
+            def invoke(self, messages):
+                response = super().invoke(messages)
+                if (messages[0].content.startswith("ROLE: task_interpreter\n")
+                        and json.loads(messages[1].content)["resolve_target"]):
+                    data = json.loads(response.content)
+                    data.pop("target")
+                    data["targets"] = ["stats.py", "__init__.py"]
+                    return AIMessage(content=json.dumps(data))
+                return response
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"stats.py").write_text(CURRENT)
+            (root/"__init__.py").write_text("")
+            result = self.execute(root, MixedModel(), "检查 stats.py 和 __init__.py，有错误就修正。")
+            self.assertEqual(result["status"], "proposed", result["errors"])
+            self.assertEqual((root/"stats.py").read_text(), BEFORE)
+            self.assertEqual((root/"__init__.py").read_text(), "")
+
+    def test_natural_project_reference_reviews_root_recursively(self):
+        for reference in ("当前项目", "当前根目录", "整个项目"):
+            with self.subTest(reference=reference), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root/"stats.py").write_text(CURRENT)
+                (root/"nested").mkdir()
+                (root/"nested/z.py").write_text(CURRENT)
+                result = self.execute(root, RequestModel(reference, mode="review", policy="forbidden"),
+                                      f"只审查{reference}的全部源码，不要修改文件。")
+                self.assertEqual(result["status"], "completed", result["errors"])
+                self.assertEqual(set(result["file_paths"]), {"stats.py", "nested/z.py"})
+                self.assertEqual((root/"stats.py").read_text(), CURRENT)
+
+    def test_project_listing_never_reads_contents_or_invokes_experts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"nested").mkdir()
+            for i in range(25):
+                (root/"nested"/f"module_{i:02d}.py").write_text("SYNTHETIC_UNREAD_FILE_CONTENT")
+            (root/"README.md").write_text("SYNTHETIC_UNREAD_DOCUMENT")
+            (root/"asset.png").write_bytes(b"\x00\xff")
+            (root/"large.py").write_bytes(b"x" * 160001)
+            for folder in (".ssh", "node_modules", "generated_tests", "output"):
+                (root/folder).mkdir()
+                (root/folder/"hidden.py").write_text("SYNTHETIC_PRIVATE_FILE")
+            (root/".env").write_text("SYNTHETIC_PRIVATE_FILE")
+            (root/"linked.py").symlink_to(root/"nested/module_00.py")
+            with patch("src.source_input.read_target", side_effect=AssertionError("Listing must not read file contents")):
+                result = self.execute(root, ListingModel("当前根目录", mode="review", policy="forbidden"),
+                                      "列出当前根目录的全部项目文件，不进行代码审查。")
+            self.assertEqual(result["status"], "completed", result["errors"])
+            self.assertEqual(len(result["project_discovery"]["files"]), 28)
+            self.assertIn("nested/module_24.py", result["final_review"])
+            self.assertIn("README.md", result["final_review"])
+            self.assertIn("asset.png", result["final_review"])
+            self.assertIn("large.py", result["final_review"])
+            self.assertNotIn("SYNTHETIC_UNREAD_FILE_CONTENT", repr(result))
+            self.assertEqual(result["reports"], {})
+            self.assertEqual(result["active_agents"], [])
+            self.assertEqual(result["write_result"]["status"], "not_run")
+
+    def test_listing_stays_inside_the_root_and_enforces_discovery_budget(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            root = Path(directory)
+            (root/"stats.py").write_text(CURRENT)
+            (root/"linked").symlink_to(Path(outside), target_is_directory=True)
+            for reference in (str(Path(outside)), "linked/"):
+                with self.subTest(reference=reference):
+                    result = self.execute(root, ListingModel(reference, mode="review", policy="forbidden"),
+                                          f"列出 {reference} 目录的文件。")
+                    self.assertEqual(result["status"], "needs_clarification")
+                    self.assertNotIn("project_discovery", result)
+            with patch("src.project_tools.MAX_PROJECT_ENTRIES", 1):
+                result = self.execute(root, ListingModel("当前项目", mode="review", policy="forbidden"),
+                                      "列出当前项目的全部文件。")
+            self.assertEqual(result["status"], "needs_clarification")
+            self.assertNotIn("project_discovery", result)
+
+    def test_root_review_keeps_the_existing_target_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for i in range(21):
+                (root/f"module_{i}.py").write_text("value = 1\n")
+            result = self.execute(root, RequestModel("当前项目", mode="review", policy="forbidden"),
+                                  "审查当前项目全部源码。")
+            self.assertEqual(result["status"], "needs_clarification")
+            self.assertIn("20", result["final_review"])
+            self.assertEqual(result["reports"], {})
+            self.assertEqual(result["active_agents"], [])
+            self.assertEqual(result["write_result"]["status"], "not_run")
+
+    def test_root_alias_cannot_replace_a_different_explicit_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"stats.py").write_text(CURRENT)
+            result = self.execute(root, RequestModel("当前项目", mode="review", policy="forbidden"),
+                                  "只审查 stats.py。")
+            self.assertEqual(result["status"], "needs_clarification")
+            self.assertEqual(result["reports"], {})
 
     def test_natural_request_writes_original_and_saves_resolved_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -69,7 +324,7 @@ class NaturalRequestTests(unittest.TestCase):
             entry = next(item for item in result["write_result"]["files"] if item["file_path"] == "stats.py")
             self.assertEqual((Path(result["run_dir"])/entry["backup"]).read_text(), CURRENT)
             self.assertFalse((root/"stats_fixed.py").exists())
-            self.assertEqual(sum(role == "task_interpreter" for role, _ in model.calls), 1)
+            self.assertEqual(sum(role == "task_interpreter" for role, _ in model.calls), 2)
             inputs = json.loads((Path(result["run_dir"])/"input.json").read_text())
             self.assertEqual(inputs["code_diff"], "")
             self.assertEqual(inputs["file_contents"], {})
@@ -109,6 +364,11 @@ class NaturalRequestTests(unittest.TestCase):
                 result = self.execute(root, model, f"修正 {reference}。")
                 self.assertEqual(result["status"], "needs_clarification")
                 self.assertEqual(len(model.calls), 1)
+                if reference == "stats.py":
+                    self.assertIn("多个同名文件", result["final_review"])
+                    self.assertIn("examples/stats.py", result["final_review"])
+                else:
+                    self.assertIn("未找到", result["final_review"])
                 self.assertEqual(result["reports"], {})
                 self.assertEqual((root/"stats.py").read_text(), CURRENT)
                 self.assertEqual((root/"examples/stats.py").read_text(), CURRENT)
@@ -274,6 +534,31 @@ class NaturalCliTests(unittest.TestCase):
                 self.assertIn("Written:", err)
                 self.assertIn("Status: written", out)
                 self.assertTrue((root/"output/fix-review.md").is_file())
+
+    def test_listing_current_project_needs_only_a_natural_sentence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"stats.py").write_text(CURRENT)
+            model = ListingModel("当前项目", mode="review", policy="forbidden")
+            with patch("src.cli._get_diff_and_files", side_effect=AssertionError("No Git or explicit input needed")):
+                code, out, err = self.invoke(root, model, ["列出当前项目的全部文件，不要修改。"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("项目文件检索", out)
+            self.assertIn("stats.py", out)
+            latest = json.loads((root/"output/latest.json").read_text())
+            result = json.loads((Path(latest["run_dir"])/"result.json").read_text())
+            self.assertEqual(result["project_discovery"]["root"], str(root.resolve()))
+            self.assertFalse(latest["candidate_valid"])
+            self.assertEqual((root/"stats.py").read_text(), CURRENT)
+
+    def test_discovery_report_cannot_overwrite_a_discovered_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"stats.py").write_text(CURRENT)
+            model = ListingModel("当前项目", mode="review", policy="forbidden")
+            code, _, _ = self.invoke(root, model, ["列出当前项目的全部文件。", "--output", "stats.py"])
+            self.assertEqual(code, 2)
+            self.assertEqual((root/"stats.py").read_text(), CURRENT)
 
     def test_resolved_readonly_target_cannot_be_overwritten_by_report_export(self):
         with tempfile.TemporaryDirectory() as directory:

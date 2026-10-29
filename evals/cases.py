@@ -1,68 +1,30 @@
-"""Live fixtures with human-authored structured expected defects."""
+"""Two review scopes of one multi-file project, with independent human labels."""
 
-CASES = [
-    {
-        "name": "sql_injection",
-        "file_paths": ["src/api/users.py"],
-        "diff": '''\
-diff --git a/src/api/users.py b/src/api/users.py
---- a/src/api/users.py
-+++ b/src/api/users.py
-@@ -0,0 +1,3 @@
-+def get_user(user_id):
-+    query = "SELECT * FROM users WHERE id = " + user_id
-+    return db.execute(query)
-''',
-        "labels": {"case_id": "sql_injection", "expected": [
-            {"id": "sql_injection", "category": "security.sql_injection", "file_path": "src/api/users.py", "line_start": 2, "line_end": 3}
-        ]},
-    },
-    {
-        "name": "hardcoded_secret",
-        "file_paths": ["src/config.py"],
-        "diff": '''\
-diff --git a/src/config.py b/src/config.py
---- a/src/config.py
-+++ b/src/config.py
-@@ -0,0 +1,2 @@
-+SECRET_KEY = "hardcoded_secret_abc123"
-+DB_PASSWORD = "admin123"
-''',
-        "labels": {"case_id": "hardcoded_secret", "expected": [
-            {"id": "secret_key", "category": "security.hardcoded_credential", "file_path": "src/config.py", "line_start": 1},
-            {"id": "database_password", "category": "security.hardcoded_credential", "file_path": "src/config.py", "line_start": 2}
-        ]},
-    },
-    {
-        "name": "off_by_one",
-        "file_paths": ["src/utils.py"],
-        "diff": '''\
-diff --git a/src/utils.py b/src/utils.py
---- a/src/utils.py
-+++ b/src/utils.py
-@@ -0,0 +1,5 @@
-+def get_last_items(items, n):
-+    result = []
-+    for i in range(len(items) - n, len(items) + 1):
-+        result.append(items[i])
-+    return result
-''',
-        "labels": {"case_id": "off_by_one", "expected": [
-            {"id": "index_bounds", "category": "correctness.index_bounds", "file_path": "src/utils.py", "line_start": 3, "line_end": 4}
-        ]},
-    },
-    {
-        "name": "clean_code_approved",
-        "file_paths": ["src/math_utils.py"],
-        "diff": '''\
-diff --git a/src/math_utils.py b/src/math_utils.py
---- a/src/math_utils.py
-+++ b/src/math_utils.py
-@@ -0,0 +1,3 @@
-+def clamp(value: float, min_val: float, max_val: float) -> float:
-+    """Return value constrained to [min_val, max_val]."""
-+    return max(min_val, min(value, max_val))
-''',
-        "labels": {"case_id": "clean_code_approved", "expected": []},
-    },
-]
+import hashlib
+import json
+from pathlib import Path
+
+from src.diff import parse_diff, validate_source_context
+from src.source_input import source_snapshot
+
+
+def load_cases():
+    repository = Path(__file__).resolve().parents[1]
+    root = repository/"examples/order_project"
+    sources = {path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
+               for path in sorted((root/"app").glob("*.py"))}
+    diff = (repository/"examples/order_project.diff").read_text(encoding="utf-8")
+    changed = {change.path for change in parse_diff(diff)}
+    cases = []
+    for name, scope, code_diff, contents in (
+        ("order_project", "file", "".join(source_snapshot(p, s) for p, s in sources.items()), sources),
+        ("order_project_diff", "diff", diff, {p: sources[p] for p in sources if p in changed}),
+    ):
+        labels = json.loads((repository/"evals/labels"/(name+".json")).read_text(encoding="utf-8"))
+        if any(hashlib.sha256(contents[path].encode()).hexdigest() != value
+               for path, value in labels["source_hashes"].items()):
+            raise ValueError("Online sample changed; restore its original version before baseline evaluation")
+        validate_source_context(contents, parse_diff(code_diff))
+        cases.append({"name": name, "review_scope": scope, "source_root": root,
+                      "file_paths": list(contents), "diff": code_diff, "sources": contents, "labels": labels})
+    return cases

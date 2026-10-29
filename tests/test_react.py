@@ -50,8 +50,9 @@ class ReadSourceTests(unittest.TestCase):
         self.assertEqual(len(result["source_hash"]), 64)
 
     def test_unavailable_and_sensitive_paths_are_not_read(self):
-        read = make_read_source({".env": "placeholder", "private.key": "placeholder"})
-        for path in ("missing.py", ".env", "private.key"):
+        paths = (".env", "private.key", ".ssh/id_rsa", ".aws/credentials", ".npmrc", "private.pfx")
+        read = make_read_source({path: "placeholder" for path in paths})
+        for path in ("missing.py", *paths):
             with self.subTest(path=path):
                 self.assertEqual(read.invoke({"file_path": path})["code"], "SOURCE_NOT_AVAILABLE")
         for path in ("../outside.py", "/etc/passwd", ".git/config"):

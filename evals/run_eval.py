@@ -37,15 +37,14 @@ def run():
         else:
             if args.labels or args.annotations or args.write_annotation_template:
                 raise ValueError("Labels and manual annotations require --report")
-            from evals.cases import CASES
+            from evals.cases import load_cases
             from src.workflow.service import run_workflow
-            from src.diff import apply_patch, parse_diff
             root = Path(args.run_root)/new_run_id()/"runs"
             results = []
-            for case in CASES:
-                changes = parse_diff(case["diff"])
-                sources = apply_patch({path: "" for path in case["file_paths"]}, changes)
-                state = run_workflow(case["diff"], case["file_paths"], mode=args.mode, file_contents=sources, run_root=root)
+            for case in load_cases():
+                state = run_workflow(case["diff"], case["file_paths"], mode=args.mode,
+                                     file_contents=case["sources"], source_root=case["source_root"],
+                                     review_scope=case["review_scope"], run_root=root)
                 from src.serialization import to_json
                 report = json.loads(to_json(state))
                 result = score_report(report, case["labels"])

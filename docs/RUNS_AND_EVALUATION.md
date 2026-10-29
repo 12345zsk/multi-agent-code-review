@@ -13,7 +13,7 @@ uv pip install --python .venv/bin/python -e .
 原来的审查/修正命令保持可用：
 
 ```bash
-.venv/bin/python -m src.cli --file examples/review_target.diff --source-root . --mode fix
+.venv/bin/python -m src.cli --file examples/order_project.diff --source-root examples/order_project --mode fix
 ```
 
 提供源码上下文时，必须使用输入 diff 对应的改动后版本。程序在创建运行和调用模型前，按 diff 新侧检查已提供文件的内容、行号、换行标记以及新增/删除文件状态；不一致时拒绝执行，CLI 返回退出码 2，不覆盖已有输出。未提供的文件仍可按 diff-only 方式审查。局部 diff 无法证明既有文件在未展示区域也属于同一版本，调用方仍需保证来源一致。
@@ -54,7 +54,7 @@ output/
     drafts/<SESSION_ID>/attempt-N/     按 patch_generator、test_generator、validator、final 分目录保留快照
 ```
 
-`validated_candidate` 要求：流程为 `proposed`，静态验证为 `passed`，模型回归为 `passed`。它仍不代表运行测试已经通过。没有完整源码、验证失败、模型回归失败或流程异常时，补丁只保存为 `draft`；根目录不发布为有效补丁。新运行没有有效补丁时，指定的兼容补丁路径会删除旧文件，旧内容仍保留在原运行目录。
+`validated_candidate` 要求：流程为 `proposed`，静态验证为 `passed`，模型回归为 `passed`。它仍不代表运行测试已经通过。没有完整源码、验证失败、模型回归失败或流程异常时，补丁只保存为 `draft`；根目录不发布为有效补丁。新运行没有有效补丁时，仅清理上一份 `latest.json` 中记录的有效候选副本，并要求文件路径、运行归属及 SHA-256 均一致；原产物仍保留在运行目录。无归属的已有文件、用户修改后的文件和无法核实的文件均保留，CLI 提示 `Preserved existing file`，`latest.json` 的 `preserved_outputs` 记录保留原因。这些文件不会列入本次 `exports`，不能通过“文件存在”判断本次运行生成了有效候选。
 
 各阶段草稿独立保存，规范化补丁不会覆盖模型原始补丁；事件引用的路径和哈希可以定位生成阶段及验证阶段的确切版本。
 
@@ -73,7 +73,7 @@ output/
 
 以上命令读取已有记录，不调用模型。事件包含：
 
-- `run_id`、`session_id`、`span_id`、`event_id` 和单调递增的 `sequence`；
+- `run_id`、`execution_id`、`span_id`、`event_id` 和单调递增的 `sequence`；旧记录的 `session_id` 仍可读取。运行追踪使用 `execution_id`，避免与需要脱敏的认证 Session 混淆；
 - 节点名、执行阶段、修正尝试次数、时间与耗时；
 - 输入摘要哈希、关联问题 ID、草稿路径和哈希；
 - 模型调用与格式重答，以及模型返回的 token 用量（若提供）；
@@ -116,7 +116,7 @@ output/
 
 自然语言决定写回的运行，会在静态和模型回归通过后调用 write_file。写入前检查全部目标；每个文件先保存原始字节备份和 prepared 回执，再原子替换并标记 written。文件写入节点中断时恢复同一候选，哈希匹配的已完成文件只确认、不重复覆盖。原文件权限与 CRLF 换行保留；新增文件没有旧内容备份。多文件写入不是事务，失败报告的 `write_result` 会显示 partial/unknown 等进度，不能据流程失败推断磁盘未改变。可用 `--inspect <RUN_ID> --node file_writer` 排查。备份不加入公开报告；需要回退时先核对回执中的路径及哈希。写入不执行目标代码或测试。
 
-所有新增回归测试统一放在 `generated_tests/`，框架测试保留在 `tests/`；只生成候选时，测试 diff 也使用独立目录。写回模式下，新增 Python 回归测试使用 `generated_tests/test_<名称>__run_<运行 ID 的 12 位哈希>.py`，在静态校验和模型复审前确定路径。不同运行保留各自的测试，同一运行的重试、重复校验和恢复保持路径不变；已有快照的测试修改仍使用原路径。报告、补丁和写入回执记录最终文件名。若新增目标在写入前被其他操作创建，会以 `WRITE_NEW_FILE_EXISTS` 拒绝覆盖；已有文件版本变化仍报 `FILE_VERSION_CHANGED`。此前因同名测试失败的旧运行应重新启动任务以生成新候选，不要删除或覆盖已有测试来绕过保护。历史报告中的旧路径不追溯改写；本次目录迁移已将原 `tests/test_examples_test*.py` 的三份历史生成测试原样移动到 `generated_tests/`。
+所有新增回归测试统一放在 `generated_tests/`，框架测试保留在 `tests/`；只生成候选时，测试 diff 也使用独立目录。写回模式下，新增 Python 回归测试使用 `generated_tests/test_<名称>__run_<运行 ID 的 12 位哈希>.py`，在静态校验和模型复审前确定路径。不同运行保留各自的测试，同一运行的重试、重复校验和恢复保持路径不变；已有快照的测试修改仍使用原路径。报告、补丁和写入回执记录最终文件名。若新增目标在写入前被其他操作创建，会以 `WRITE_NEW_FILE_EXISTS` 拒绝覆盖；已有文件版本变化仍报 `FILE_VERSION_CHANGED`。此前因同名测试失败的旧运行应重新启动任务以生成新候选，不要删除或覆盖已有测试来绕过保护。旧在线样例和历史生成测试已清空。当前订单样例的新增测试写到其源码边界下的 examples/order_project/generated_tests/。
 
 代码版本、依赖版本、模型名称、原始输入哈希和恢复会话都会留档。检查点反序列化使用明确类型白名单，禁用 pickle。恢复依赖完整可读的本地检查点与输入；损坏的数据库不会被猜测重建。进程在模型响应与检查点提交之间中断时，该请求可能重试，不承诺网络调用恰好执行一次。
 
@@ -133,14 +133,14 @@ recovered = resume_workflow(result["run_id"], run_root="output/runs")  # 仅用�
 
 每条 Finding 具有结构化 `category`，如 `security.sql_injection` 或 `correctness.pagination`。评分只使用最终 `confirmed` 发现；候选项不计为成功检出，被拒绝项不计入预测。
 
-代表性订单样例的人工基准在 `evals/labels/review_target.json`，包含五个独立缺陷的类别、文件、期望行范围及源码哈希。修改样例后，应重新人工确认并更新标注；不能直接把模型输出作为基准。
+代表性订单样例的人工基准在 `evals/labels/order_project.json`，包含八类预设缺陷的类别、文件、期望行范围及源码哈希；diff 范围单独使用 evals/labels/order_project_diff.json。修改样例后，应重新人工确认并更新标注；不能直接把模型输出作为基准。
 
 先评估指定运行中的结构化结果（不调用模型）：
 
 ```bash
 .venv/bin/python -m evals.run_eval \
   --report output/runs/<RUN_ID>/result.json \
-  --labels evals/labels/review_target.json \
+  --labels evals/labels/order_project.json \
   --output output/evaluation.json
 ```
 
@@ -173,7 +173,7 @@ recovered = resume_workflow(result["run_id"], run_root="output/runs")  # 仅用�
 ```bash
 .venv/bin/python -m evals.run_eval \
   --report output/runs/<RUN_ID>/result.json \
-  --labels evals/labels/review_target.json \
+  --labels evals/labels/order_project.json \
   --annotations output/human-annotations.json \
   --output output/evaluation-human.json
 ```
@@ -198,4 +198,4 @@ recovered = resume_workflow(result["run_id"], run_root="output/runs")  # 仅用�
 .venv/bin/python -m evals.run_eval --mode review
 ```
 
-它会调用模型，为每个样例保存独立运行记录，并输出 `output/evaluation.json`。批量评估的人工基准在 `evals/cases.py`；这些小样例用于回归，不能代表全部语言和企业代码库的质量。
+它会调用模型，为每个样例保存独立运行记录，并输出 `output/evaluation.json`。批量评估统一加载新订单项目的整文件与 diff 两种范围，标签在 evals/labels/，加载器在 evals/cases.py。它们不能代表全部语言和企业代码库的质量。
